@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -25,34 +25,24 @@ POSTPROC_QUEUE_VERSION = 2
 
 REC_RAR_VERSION = 550
 
-PNFO = namedtuple(
-    "PNFO",
-    "repair unpack delete script nzo_id filename labels password unpackstrht "
-    "msgid category url bytes_left bytes avg_stamp avg_date finished_files "
-    "active_files queued_files status priority bytes_missing direct_unpack",
-)
-
-QNFO = namedtuple("QNFO", "bytes bytes_left bytes_left_previous_page list q_size_list q_fullsize")
-
 ANFO = namedtuple("ANFO", "article_sum cache_size cache_limit")
 
 # Leave some space for "_UNPACK_" which we append during post-proc
 # Or, when extra ".1", ".2" etc. are added for identically named jobs
 DEF_FOLDER_MAX = 256 - 10
 DEF_FILE_MAX = 255 - 10  # max filename length on modern filesystems, minus some room for extra chars later on
+DEX_FILE_EXTENSION_MAX = 20
 
-GIGI = float(2 ** 30)
-MEBI = float(2 ** 20)
-KIBI = float(2 ** 10)
+GIGI = float(2**30)
+MEBI = float(2**20)
+KIBI = float(2**10)
 
-BYTES_FILE_NAME_OLD = "totals9.sab"
 BYTES_FILE_NAME = "totals10.sab"
 QUEUE_FILE_TMPL = "queue%s.sab"
 QUEUE_FILE_NAME = QUEUE_FILE_TMPL % QUEUE_VERSION
 POSTPROC_QUEUE_FILE_NAME = "postproc%s.sab" % POSTPROC_QUEUE_VERSION
 RSS_FILE_NAME = "rss_data.sab"
 SCAN_FILE_NAME = "watched_data2.sab"
-RATING_FILE_NAME = "Rating.sab"
 FUTURE_Q_FOLDER = "future"
 JOB_ADMIN = "__ADMIN__"
 VERIFIED_FILE = "__verified__"
@@ -60,7 +50,7 @@ RENAMES_FILE = "__renames__"
 ATTRIB_FILE = "SABnzbd_attrib"
 REPAIR_REQUEST = "repair-all.sab"
 
-SABYENC_VERSION_REQUIRED = "4.0.0"
+SABCTOOLS_VERSION_REQUIRED = "8.2.5"
 
 DB_HISTORY_VERSION = 1
 DB_HISTORY_NAME = "history%s.db" % DB_HISTORY_VERSION
@@ -72,8 +62,9 @@ DEF_NZBBACK_DIR = ""
 DEF_LANGUAGE = "locale"
 DEF_INTERFACES = "interfaces"
 DEF_EMAIL_TMPL = "email"
-DEF_STDCONFIG = "Config"
-DEF_STDINTF = "Glitter"
+DEF_STD_CONFIG = "Config"
+DEF_STD_WEB_DIR = "Glitter"
+DEF_STD_WEB_COLOR = "Auto"
 DEF_MAIN_TMPL = os.path.normpath("templates/main.tmpl")
 DEF_INI_FILE = "sabnzbd.ini"
 DEF_HOST = "127.0.0.1"
@@ -84,16 +75,34 @@ DEF_LOG_ERRFILE = "sabnzbd.error.log"
 DEF_LOG_CHERRY = "cherrypy.log"
 DEF_ARTICLE_CACHE_DEFAULT = "500M"
 DEF_ARTICLE_CACHE_MAX = "1G"
-DEF_TIMEOUT = 60
+DEF_NETWORKING_TIMEOUT = 60
+DEF_NETWORKING_TEST_TIMEOUT = 5
+DEF_NETWORKING_SHORT_TIMEOUT = 3
 DEF_SCANRATE = 5
+DEF_HTTPS_CERT_FILE = "server.cert"
+DEF_HTTPS_KEY_FILE = "server.key"
+DEF_SORTER_RENAME_SIZE = "50M"
 MAX_WARNINGS = 20
 MAX_BAD_ARTICLES = 5
 
+CONFIG_BACKUP_FILES = [
+    BYTES_FILE_NAME,
+    RSS_FILE_NAME,
+    DB_HISTORY_NAME,
+]
+CONFIG_BACKUP_HTTPS = {  # "basename": "associated setting"
+    DEF_HTTPS_CERT_FILE: "https_cert",
+    DEF_HTTPS_KEY_FILE: "https_key",
+    "server.chain": "https_chain",
+}
+
 # Constants affecting download performance
-MIN_DECODE_QUEUE = 10
-LIMIT_DECODE_QUEUE = 100
-DIRECT_WRITE_TRIGGER = 35
-MAX_ASSEMBLER_QUEUE = 5
+MAX_ASSEMBLER_QUEUE = 12
+SOFT_QUEUE_LIMIT = 0.5
+# Percentage of cache to use before adding file to assembler
+ASSEMBLER_WRITE_THRESHOLD = 5
+NNTP_BUFFER_SIZE = int(800 * KIBI)
+NTTP_MAX_BUFFER_SIZE = int(10 * MEBI)
 
 REPAIR_PRIORITY = 3
 FORCE_PRIORITY = 2
@@ -102,8 +111,9 @@ NORMAL_PRIORITY = 0
 LOW_PRIORITY = -1
 DEFAULT_PRIORITY = -100
 PAUSED_PRIORITY = -2
-DUP_PRIORITY = -3
 STOP_PRIORITY = -4
+
+PP_LOOKUP = {0: "", 1: "R", 2: "U", 3: "D"}
 
 INTERFACE_PRIORITIES = {
     FORCE_PRIORITY: "Force",
@@ -113,19 +123,31 @@ INTERFACE_PRIORITIES = {
     LOW_PRIORITY: "Low",
 }
 
-STAGES = {"Source": 0, "Download": 1, "Servers": 2, "Repair": 3, "Filejoin": 4, "Unpack": 5, "Script": 6}
+STAGES = {
+    "RSS": 0,
+    "Source": 1,
+    "Download": 2,
+    "Servers": 3,
+    "Repair": 4,
+    "Filejoin": 5,
+    "Unpack": 6,
+    "Deobfuscate": 7,
+    "Script": 8,
+}
 
 VALID_ARCHIVES = (".zip", ".rar", ".7z")
 VALID_NZB_FILES = (".nzb", ".gz", ".bz2")
 
 CHEETAH_DIRECTIVES = {"directiveStartToken": "<!--#", "directiveEndToken": "#-->", "prioritizeSearchListOverSelf": True}
 
-IGNORED_FOLDERS = ("@eaDir", ".appleDouble")
+IGNORED_FILES_AND_FOLDERS = ("@eaDir", ".appleDouble", ".DS_Store")
 IGNORED_MOVIE_FOLDERS = ("video_ts", "audio_ts", "bdmv")
 
 EXCLUDED_GUESSIT_PROPERTIES = [
     "part",
 ]
+GUESSIT_PART_INDICATORS = ("cd", "part")
+GUESSIT_SORT_TYPES = {0: "all", 1: "tv", 2: "date", 3: "movie", 4: "unknown"}
 
 
 class Status:
@@ -145,4 +167,19 @@ class Status:
     RUNNING = "Running"  # PP: User's post processing script is running
     VERIFYING = "Verifying"  # PP: Job is being verified (by par2)
     DELETED = "Deleted"  # Q:  Job has been deleted (and is almost gone)
-    PROP = "Propagating"  # Q:  Delayed download
+    PROPAGATING = "Propagating"  # Q:  Delayed download
+
+
+class DuplicateStatus:
+    DUPLICATE = "Duplicate"  # Simple duplicate
+    DUPLICATE_ALTERNATIVE = "Duplicate Alternative"  # Alternative duplicate for a queued job
+    SMART_DUPLICATE = "Smart Duplicate"  # Simple Series duplicate
+    SMART_DUPLICATE_ALTERNATIVE = "Smart Duplicate Alternative"  # Alternative duplicate for a queued job
+    DUPLICATE_IGNORED = "Duplicate Ignored"
+
+
+class AddNzbFileResult:
+    RETRY = "Retry"  # File could not be read
+    ERROR = "Error"  # Rejected as duplicate, by pre-queue script or other failure to process file
+    OK = "OK"  # Added to queue
+    NO_FILES_FOUND = "No files found"  # Malformed or might not be an NZB file

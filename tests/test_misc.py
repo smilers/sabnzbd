@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -23,13 +23,13 @@ import datetime
 import subprocess
 import sys
 import tempfile
-from unittest import mock
+from random import randint, sample
 
 from sabnzbd import lang
 from sabnzbd import misc
 from sabnzbd import newsunpack
-from sabnzbd.config import ConfigCat
-from sabnzbd.constants import HIGH_PRIORITY, FORCE_PRIORITY, DEFAULT_PRIORITY, NORMAL_PRIORITY
+from sabnzbd.config import ConfigCat, get_sorters, save_config
+from sabnzbd.constants import HIGH_PRIORITY, FORCE_PRIORITY, DEFAULT_PRIORITY, NORMAL_PRIORITY, GUESSIT_SORT_TYPES
 from tests.testhelper import *
 
 
@@ -62,10 +62,52 @@ class TestMisc:
         assert "all caps" == misc.safe_lower("ALL CAPS")
         assert "" == misc.safe_lower(None)
 
+    def test_is_none(self):
+        assert misc.is_none(None) is True
+        assert misc.is_none(0) is True
+        assert misc.is_none(False) is True
+        assert misc.is_none("None") is True
+        assert misc.is_none("nOne") is True
+
+        assert misc.is_none(True) is False
+        assert misc.is_none(1) is False
+        assert misc.is_none(True) is False
+        assert misc.is_none("Not None") is False
+
+    def test_clean_comma_separated_list(self):
+        assert misc.clean_comma_separated_list("") == []
+        assert misc.clean_comma_separated_list(None) == []
+        assert misc.clean_comma_separated_list(123) == []
+        assert misc.clean_comma_separated_list("a,b") == ["a", "b"]
+        assert misc.clean_comma_separated_list(",b") == ["b"]
+        assert misc.clean_comma_separated_list("   a  ,  b  ") == ["a", "b"]
+        assert misc.clean_comma_separated_list(["a  ", "  b", ""]) == ["a", "b"]
+
     def test_cmp(self):
         assert misc.cmp(1, 2) < 0
         assert misc.cmp(2, 1) > 0
         assert misc.cmp(1, 1) == 0
+
+    @pytest.mark.parametrize(
+        "cat, pp, script, expected",
+        [
+            (None, None, None, (None, None, None)),
+            ("", "", "", (None, None, None)),
+            ("none", "-1", "default", (None, None, None)),
+            ("SomeCategory", "5", "SomeScript", ("SomeCategory", "5", "SomeScript")),
+            ("none", 0, "default", (None, 0, None)),
+            ("Movies", "", "default", ("Movies", None, None)),
+            ("", "10", "default", (None, "10", None)),
+            ("none", "15", "", (None, "15", None)),
+            ("none", 0, "Default", (None, 0, None)),
+            ("other", "-1", "Default", ("other", None, None)),
+            ("none", "None", "default", (None, None, None)),
+            ("some", "none", "script", ("some", None, "script")),
+            ("none", "NONE", "Default", (None, None, None)),
+        ],
+    )
+    def test_cat_pp_script_sanitizer(self, cat, pp, script, expected):
+        assert misc.cat_pp_script_sanitizer(cat, pp, script) == expected
 
     def test_cat_to_opts(self):
         # Need to create the Default category, as we would in normal instance
@@ -117,19 +159,24 @@ class TestMisc:
         assert 1125899906842624.0 == misc.from_units("1P")
 
     def test_to_units(self):
+        assert "" == misc.to_units("foobar")
         assert "1 K" == misc.to_units(1024)
         assert "1 KBla" == misc.to_units(1024, postfix="Bla")
         assert "1.0 M" == misc.to_units(1024 * 1024)
         assert "1.0 M" == misc.to_units(1024 * 1024 + 10)
+        assert "-1.0 M" == misc.to_units(-1024 * 1024)
         assert "10.0 M" == misc.to_units(1024 * 1024 * 10)
         assert "100.0 M" == misc.to_units(1024 * 1024 * 100)
         assert "9.8 G" == misc.to_units(1024 * 1024 * 10000)
-        assert "1024.0 P" == misc.to_units(1024 ** 6)
+        assert "1024.0 P" == misc.to_units(1024**6)
 
     def test_unit_back_and_forth(self):
         assert 100 == misc.from_units(misc.to_units(100))
         assert 1024 == misc.from_units(misc.to_units(1024))
-        assert 1024 ** 3 == misc.from_units(misc.to_units(1024 ** 3))
+        assert 1024**3 == misc.from_units(misc.to_units(1024**3))
+
+        # Negative numbers are not supported
+        assert 100 == misc.from_units(misc.to_units(-100))
 
     def test_caller_name(self):
         @set_config({"log_level": 0})
@@ -193,6 +240,54 @@ class TestMisc:
         assert "1 Stunde 1 Minuten 1 Sekunde" == misc.format_time_string(60 * 60 + 60 + 1)
         assert "1 Tag 59 Sekunden" == misc.format_time_string(86400 + 59)
         assert "2 Tage 2 Stunden 2 Sekunden" == misc.format_time_string(2 * 86400 + 2 * 60 * 60 + 2)
+        # Reset language
+        lang.set_language()
+
+    def test_format_time_left(self):
+        assert "0:00:00" == misc.format_time_left(0)
+        assert "0:00:00" == misc.format_time_left(-1)
+        assert "0:00:01" == misc.format_time_left(1)
+        assert "0:01:01" == misc.format_time_left(60 + 1)
+        assert "0:11:10" == misc.format_time_left(60 * 11 + 10)
+        assert "3:11:10" == misc.format_time_left(60 * 60 * 3 + 60 * 11 + 10)
+        assert "13:11:10" == misc.format_time_left(60 * 60 * 13 + 60 * 11 + 10)
+        assert "1:09:11:10" == misc.format_time_left(60 * 60 * 33 + 60 * 11 + 10)
+
+    def test_format_time_left_short(self):
+        assert "0:00" == misc.format_time_left(0, short_format=True)
+        assert "0:01" == misc.format_time_left(1, short_format=True)
+        assert "1:01" == misc.format_time_left(60 + 1, short_format=True)
+        assert "11:10" == misc.format_time_left(60 * 11 + 10, short_format=True)
+        assert "3:11:10" == misc.format_time_left(60 * 60 * 3 + 60 * 11 + 10, short_format=True)
+        assert "13:11:10" == misc.format_time_left(60 * 60 * 13 + 60 * 11 + 10, short_format=True)
+        assert "1:09:11:10" == misc.format_time_left(60 * 60 * 33 + 60 * 11 + 10, short_format=True)
+
+    @pytest.mark.parametrize(
+        "value, default, expected, description",
+        [
+            (None, "", "", "Test with None value and default empty string"),
+            (None, "default", "default", "Test with None value and default 'default'"),
+            (0, "", "0", "Test with zero value"),
+            (1, "", "1", "Test with one value"),
+            (-1, "", "-1", "Test with negative one value"),
+            (100, "", "100", "Test with 100 value"),
+            ("abc", "", "abc", "Test with alphabetic string"),
+            ("", "", "", "Test with empty string"),
+            (True, "", "True", "Test with boolean True value"),
+            (False, "", "False", "Test with boolean False value"),
+            (0.0, "", "0.0", "Test with float zero value"),
+            (1.5, "", "1.5", "Test with positive float value"),
+            (-2.7, "", "-2.7", "Test with negative float value"),
+            (complex(1, 1), "", "(1+1j)", "Test with complex number"),
+            ([], "", "[]", "Test with empty list"),
+            ([1, 2, 3], "", "[1, 2, 3]", "Test with list of integers"),
+            ({}, "", "{}", "Test with empty dictionary"),
+            ({"key": "value"}, "", "{'key': 'value'}", "Test with dictionary"),
+            (set(), "", "set()", "Test with empty set"),
+        ],
+    )
+    def test_str_conv(self, value, default, expected, description):
+        assert misc.str_conv(value, default) == expected
 
     def test_int_conv(self):
         assert 0 == misc.int_conv("0")
@@ -202,6 +297,32 @@ class TestMisc:
         assert 0 == misc.int_conv(None)
         assert 1 == misc.int_conv(True)
         assert 0 == misc.int_conv(object)
+
+    @pytest.mark.parametrize(
+        "value, expected, description",
+        [
+            (None, False, "Test with None value"),
+            (0, False, "Test with zero value"),
+            ("0", False, "Test with zero string"),
+            (1, True, "Test with one value"),
+            (-1, True, "Test with negative one value"),
+            (100, True, "Test with 100 value"),
+            ("1", True, "Test with one string"),
+            ("100", True, "Test with 100 string"),
+            ("", False, "Test with empty string"),
+            ("abc", False, "Test with non-numeric string"),
+            ("true", False, "Test with 'true' string"),
+            (True, True, "Test with boolean True value"),
+            (False, False, "Test with boolean False value"),
+            (0.0, False, "Test with float zero value"),
+            (1.5, True, "Test with positive float value"),
+            (-2.7, True, "Test with negative float value"),
+            ("1.5", False, "Test with float string value"),
+            ("0.0", False, "Test with float zero string value"),
+        ],
+    )
+    def test_bool_conv(self, value, expected, description):
+        assert misc.bool_conv(value) == expected, description
 
     def test_create_https_certificates(self):
         cert_file = "test.cert"
@@ -259,14 +380,30 @@ class TestMisc:
             (["", "cmd1", "5"], '"" "cmd1" "5"'),  # sending blank string
             (["cmd1", None, "cmd3", "tail -f"], '"cmd1" "" "cmd3" "tail -f"'),  # sending None in command
             (["cmd1", 0, "ps ux"], '"cmd1" "" "ps ux"'),  # sending 0
+            (['pass"word', "command"], '"pass""word" "command"'),  # special escaping of unrar
         ],
     )
-    def test_list_to_cmd(self, test_input, expected_output):
+    def test_list2cmdline_unrar(self, test_input, expected_output):
         """Test to convert list to a cmd.exe-compatible command string"""
-
-        res = misc.list2cmdline(test_input)
+        res = misc.list2cmdline_unrar(test_input)
         # Make sure the output is cmd.exe-compatible
         assert res == expected_output
+
+    def test_recursive_html_escape(self):
+        """Very basic test if the recursive clean-up works"""
+        input_test = {
+            "foo": "<b>?ar'\"",
+            "test_list": ["test&1", 'test"2'],
+            "test_nested_list": [["test&1", 'test"2', 4]],
+            "test_dict": {"test": ["test<>1", "#"]},
+        }
+        # Dict is updated in-place
+        misc.recursive_html_escape(input_test)
+        # Have to check them by hand
+        assert input_test["foo"] == "&lt;b&gt;?ar&#x27;&quot;"
+        assert input_test["test_list"] == ["test&amp;1", "test&quot;2"]
+        assert input_test["test_nested_list"] == [["test&amp;1", "test&quot;2", 4]]
+        assert input_test["test_dict"]["test"] == ["test&lt;&gt;1", "#"]
 
     @pytest.mark.parametrize(
         "value, result",
@@ -428,6 +565,70 @@ class TestMisc:
         assert misc.is_lan_addr(value) is result
 
     @pytest.mark.parametrize(
+        "value, local_ranges, result",
+        [
+            ("10.11.12.13", None, True),
+            ("172.16.2.81", None, True),
+            ("192.168.255.255", None, True),
+            ("169.254.42.42", None, True),  # Link-local
+            ("fd00::ffff", None, True),  # Part of fc00::/7, IPv6 "Unique Local Addresses"
+            ("fe80::a1", None, True),  # IPv6 Link-local
+            ("::1", None, False),
+            ("localhost", None, False),
+            ("127.0.0.1", None, False),
+            ("2001:1337:babe::", None, False),
+            ("172.32.32.32", None, False),  # Near but not part of 172.16.0.0/12
+            ("100.64.0.1", None, False),  # Test net
+            ("[2001::1]", None, False),
+            ("::", None, False),
+            ("::a:b:c", None, False),
+            ("1.2.3.4", None, False),
+            ("255.255.255.255", None, False),
+            ("0.0.0.0", None, False),
+            ("127.0.0.1", None, False),
+            ("400.500.600.700", None, False),
+            ("blabla", None, False),
+            (-666, None, False),
+            ("example.org", None, False),
+            (None, None, False),
+            ("", None, False),
+            ("[1.2.3.4]", None, False),
+            ("2001:1", None, False),
+            ("2001::[2001::1]", None, False),
+            ("::ffff:192.168.1.100", None, True),
+            ("::ffff:1.1.1.1", None, False),
+            ("::ffff:127.0.0.1", None, False),
+            ("10.11.12.13", "10.0.0.0/8", True),
+            ("10.11.12.13", "12.34.56.78, 10.0.0.0/8", True),
+            ("10.11.12.13", "10.0.0.0/24", False),
+            ("172.16.2.81", "10.0.0.0/24", False),
+            ("192.168.255.255", "2001::/64", False),
+            ("2001:1337:babe::42", "2001:1337:babe::/48", True),
+            ("2001:1337:babe::11", "1002:1337:babe::/48", False),
+            ("2001:1337:babe::", "2001:1337:babe::/16", False),  # Invalid local range
+            ("2001:1337:babe::", "1002:1337:babe::/8", False),  # Idem
+            ("2001::1", "2001::/2", False),
+            ("::", "1.2.3.0/26, 9.8.7.6", False),
+            ("::a:b:c", "1.2.3.0/26, 9.8.7.6", False),
+            ("1.2.3.4", "1.2.3.0/24, 9.8.7.6", True),
+            ("1.2.3.4", "1.2.3.4/32, 9.8.7.6", True),
+            ("1.2.3.4", "9.8.7.6, 1.2.3.4/32", True),
+            ("1.2.3.4", "ffff:1234::/128, 1.2.3.4/32, 9.8.7.6", True),
+            ("ffff:1234::0", "ffff:1234::/128, 1.2.3.4/32, 9.8.7.6", True),
+            ("EEEE::ccc", "ffff:1234::/128, 1.2.3.4/32, 9.8.7.6", False),
+            ("FFFFFFFF:1234::0", "ffff:1234::/128, 1.2.3.4/32, 9.8.7.6", False),
+            ("1.2.3.4", "1.2.3.3/32, 9.8.7.6", False),
+            ("1.2.3.4", "1.2.3.5/32, 9.8.7.6", False),
+        ],
+    )
+    def test_is_local_addr(self, value, local_ranges, result):
+        @set_config({"local_ranges": local_ranges})
+        def _func():
+            assert misc.is_local_addr(value) is result
+
+        _func()
+
+    @pytest.mark.parametrize(
         "ip, subnet, result",
         [
             ("2001:c0f:fee::1", "2001:c0f:fee", True),  # Old-style range setting
@@ -510,6 +711,132 @@ class TestMisc:
     def test_strip_ipv4_mapped_notation(self, ip, result):
         misc.strip_ipv4_mapped_notation(ip) == result
 
+    def test_sort_to_opts(self):
+        for result, sort_type in GUESSIT_SORT_TYPES.items():
+            assert misc.sort_to_opts(sort_type) == result
+
+    @pytest.mark.parametrize(
+        "sort_type, result",
+        [
+            ("", 0),
+            ("foobar", 0),
+            (False, 0),
+            (666, 0),
+        ],
+    )
+    def test_sort_to_opts_edge_cases(self, sort_type, result):
+        assert misc.sort_to_opts(sort_type) == result
+
+    @pytest.mark.parametrize("movie_limit", ["", "42M"])
+    @pytest.mark.parametrize("episode_limit", ["", "13M"])
+    @pytest.mark.parametrize("movie_sort_extra", ["", "disc%1"])
+    @pytest.mark.parametrize("tv_enabled", [True, False])
+    @pytest.mark.parametrize("tv_str", ["", "foobar tv"])
+    @pytest.mark.parametrize("tv_cats", [sample(["tv", "sports"], randint(0, 2))])
+    @pytest.mark.parametrize("date_enabled", [True, False])
+    @pytest.mark.parametrize("date_str", ["", "foobar date"])
+    @pytest.mark.parametrize("date_cats", [sample(["date"], randint(0, 1))])
+    @pytest.mark.parametrize("movie_enabled", [True, False])
+    @pytest.mark.parametrize("movie_str", ["", "foobar movie"])
+    @pytest.mark.parametrize("movie_cats", [[], ["movie"], ["movie", "horror", "docu"]])
+    def test_convert_sorter_settings(
+        self,
+        movie_limit,
+        episode_limit,
+        movie_sort_extra,
+        tv_enabled,
+        tv_str,
+        tv_cats,
+        date_enabled,
+        date_str,
+        date_cats,
+        movie_enabled,
+        movie_str,
+        movie_cats,
+    ):
+        @set_config(
+            {
+                "movie_rename_limit": movie_limit,
+                "episode_rename_limit": episode_limit,
+                "movie_sort_extra": movie_sort_extra,
+                "enable_tv_sorting": tv_enabled,
+                "tv_sort_string": tv_str,
+                "tv_categories": tv_cats,
+                "enable_movie_sorting": movie_enabled,
+                "movie_sort_string": movie_str,
+                "movie_categories": movie_cats,
+                "enable_date_sorting": date_enabled,
+                "date_sort_string": date_str,
+                "date_categories": date_cats,
+                "language": "en",  # Avoid translated sorter names in the test
+            }
+        )
+        def _func():
+            # Delete any leftover/pre-defined new-style sorters
+            if existing_sorters := get_sorters():
+                for config in list(existing_sorters.keys()):
+                    try:
+                        existing_sorters[config].delete()
+                    except NameError as error:
+                        if "CFG_OBJ" in str(error):
+                            # Ignore failure to save the config to file in this very barebones test environment
+                            pass
+            assert not get_sorters()
+
+            # Run conversion
+            misc.convert_sorter_settings()
+
+            try:
+                save_config()
+            except NameError as error:
+                if "CFG_OBJ" in str(error):
+                    # Once again, ignore failure to save the config
+                    pass
+
+            # Verify the resulting config
+            new_sorters = get_sorters()
+            new_sorter_count = 0
+
+            for old_sorter_type, old_name, old_str, old_cats, old_enabled in (
+                ("tv", "Series Sorting", tv_str, tv_cats, tv_enabled),
+                ("date", "Date Sorting", date_str, date_cats, date_enabled),
+                ("movie", "Movie Sorting", movie_str, movie_cats, movie_enabled),
+            ):
+                if not old_str or not old_cats or not old_enabled:
+                    # Without these two essential variables, no new sorter config should be generated
+                    assert old_name not in new_sorters.keys()
+                    continue
+
+                # Run basic checks on the new sorter
+                assert new_sorters[old_name]
+                new_sorter = new_sorters[old_name].get_dict()
+                assert len(new_sorter) == 8
+
+                # Handle the old, movie-specific sorting features
+                size_limit = movie_limit if old_sorter_type == "movie" else episode_limit
+                part_label = movie_sort_extra if old_sorter_type == "movie" else ""
+
+                # Verify the entire new sorter config
+                for key, value in (
+                    ("name", old_name),
+                    ("order", new_sorter_count),
+                    ("min_size", size_limit),
+                    ("multipart_label", part_label),
+                    ("sort_string", old_str),
+                    ("sort_cats", old_cats),
+                    ("sort_type", [misc.sort_to_opts(old_sorter_type)]),
+                    ("is_active", int(old_enabled)),
+                ):
+                    assert (new_sorter[key]) == value
+
+                # Update counter
+                new_sorter_count += 1
+
+            # Verify no extra sorters appeared out of nowhere
+            assert new_sorter_count == len(new_sorters)
+
+        _func()
+
 
 class TestBuildAndRunCommand:
     # Path should exist
@@ -541,8 +868,8 @@ class TestBuildAndRunCommand:
         # See: https://github.com/sabnzbd/sabnzbd/issues/1043
         misc.build_and_run_command(["UnRar.exe", "\\\\?\\C:\\path\\"])
         assert mock_subproc_popen.call_args[0][0] == ["UnRar.exe", "\\\\?\\C:\\path\\"]
-        misc.build_and_run_command(["UnRar.exe", "\\\\?\\C:\\path\\"], flatten_command=True)
-        assert mock_subproc_popen.call_args[0][0] == '"UnRar.exe" "\\\\?\\C:\\path\\"'
+        misc.build_and_run_command(["UnRar.exe", "\\\\?\\C:\\path\\", "pass'\"word"], windows_unrar_command=True)
+        assert mock_subproc_popen.call_args[0][0] == '"UnRar.exe" "\\\\?\\C:\\path\\" "pass\'""word"'
 
     @mock.patch("sabnzbd.misc.userxbit")
     @mock.patch("subprocess.Popen")
@@ -572,6 +899,11 @@ class TestBuildAndRunCommand:
             "input 1",
         ]
         os.remove(temp_file_path)
+
+        # Make sure Windows UnRar patching stays on Windows
+        test_cmd = ["unrar", "/home/", "pass'\"word"]
+        misc.build_and_run_command(test_cmd, windows_unrar_command=True)
+        assert mock_subproc_popen.call_args[0][0] == test_cmd
 
         # Have to fake these for it to work
         newsunpack.IONICE_COMMAND = "ionice"

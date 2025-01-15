@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -21,7 +21,7 @@ sabnzbd.interface - webinterface
 
 import os
 import time
-from datetime import datetime
+import datetime
 import cherrypy
 import logging
 import urllib.parse
@@ -30,14 +30,14 @@ import hashlib
 import socket
 import ssl
 import functools
+import copy
 from random import randint
 from xml.sax.saxutils import escape
 from Cheetah.Template import Template
-from typing import Optional, Callable, Union
+from typing import Optional, Callable, Union, Any, Dict
 from guessit.api import properties as guessit_properties
 
 import sabnzbd
-import sabnzbd.rss
 from sabnzbd.misc import (
     to_units,
     from_units,
@@ -47,17 +47,21 @@ from sabnzbd.misc import (
     get_base_url,
     is_ipv4_addr,
     is_ipv6_addr,
-    get_server_addrinfo,
     is_lan_addr,
+    is_local_addr,
     is_loopback_addr,
-    ip_in_subnet,
+    recursive_html_escape,
+    is_none,
+    get_cpu_name,
+    clean_comma_separated_list,
 )
+from sabnzbd.happyeyeballs import happyeyeballs
 from sabnzbd.filesystem import (
     real_path,
     globber,
     globber_full,
     clip_path,
-    same_file,
+    same_directory,
     setname_from_path,
 )
 from sabnzbd.encoding import xml_name, utob
@@ -65,9 +69,19 @@ import sabnzbd.config as config
 import sabnzbd.cfg as cfg
 import sabnzbd.notifier as notifier
 import sabnzbd.newsunpack
-from sabnzbd.utils.servertests import test_nntp_server_dict
 import sabnzbd.utils.ssdp
-from sabnzbd.constants import DEF_STDCONFIG, DEFAULT_PRIORITY, CHEETAH_DIRECTIVES, EXCLUDED_GUESSIT_PROPERTIES
+from sabnzbd.constants import (
+    DEF_STD_CONFIG,
+    DEFAULT_PRIORITY,
+    CHEETAH_DIRECTIVES,
+    EXCLUDED_GUESSIT_PROPERTIES,
+    DEF_HTTPS_CERT_FILE,
+    DEF_SORTER_RENAME_SIZE,
+    GUESSIT_SORT_TYPES,
+    VALID_NZB_FILES,
+    VALID_ARCHIVES,
+    DEF_NETWORKING_TEST_TIMEOUT,
+)
 from sabnzbd.lang import list_languages
 from sabnzbd.api import (
     list_scripts,
@@ -142,12 +156,16 @@ def secured_expose(
         # Check if config is locked
         if check_configlock and cfg.configlock():
             cherrypy.response.status = 403
-            return _MSG_ACCESS_DENIED_CONFIG_LOCK
+            if cfg.api_warnings():
+                return _MSG_ACCESS_DENIED_CONFIG_LOCK
+            return
 
         # Check if external access and if it's allowed
         if not check_access(access_type=access_type, warn_user=True):
             cherrypy.response.status = 403
-            return _MSG_ACCESS_DENIED
+            if cfg.api_warnings():
+                return _MSG_ACCESS_DENIED
+            return
 
         # Verify login status, only for non-key pages
         if check_for_login and not check_api_key and not check_login():
@@ -156,14 +174,17 @@ def secured_expose(
         # Verify host used for the visit
         if not check_hostname():
             cherrypy.response.status = 403
-            return _MSG_ACCESS_DENIED_HOSTNAME
+            if cfg.api_warnings():
+                return _MSG_ACCESS_DENIED_HOSTNAME
+            return
 
         # Some pages need correct API key
         if check_api_key:
-            msg = check_apikey(kwargs)
-            if msg:
+            if msg := check_apikey(kwargs):
                 cherrypy.response.status = 403
-                return msg
+                if cfg.api_warnings():
+                    return msg
+                return
 
         # All good, cool!
         return wrap_func(*args, **kwargs)
@@ -185,15 +206,18 @@ def check_access(access_type: int = 4, warn_user: bool = False) -> bool:
 
     remote_ip = cherrypy.request.remote.ip
 
-    # Check for localhost
-    if is_loopback_addr(remote_ip):
-        return True
+    # Check if the client IP is a loopback address or considered local
+    is_allowed = is_loopback_addr(remote_ip) or is_local_addr(remote_ip)
 
-    if not cfg.local_ranges():
-        # No local ranges defined, allow all private addresses by default
-        is_allowed = is_lan_addr(remote_ip)
-    else:
-        is_allowed = any(ip_in_subnet(remote_ip, r) for r in cfg.local_ranges())
+    # Never check the XFF header unless access would have been granted based on the remote IP alone!
+    if (
+        is_allowed
+        and cfg.verify_xff_header()
+        and (xff_ips := clean_comma_separated_list(cherrypy.request.headers.get("X-Forwarded-For")))
+    ):
+        is_allowed = all(is_local_addr(ip) or is_loopback_addr(ip) for ip in xff_ips)
+        if not is_allowed:
+            logging.debug("Denying access based on X-Forwarded-For IPs '%s'", xff_ips)
 
     if not is_allowed and warn_user:
         log_warning_and_ip(T("Refused connection from:"))
@@ -333,35 +357,28 @@ def check_apikey(kwargs):
         return None
 
     # First check API-key, if OK that's sufficient
-    if not cfg.disable_key():
-        key = kwargs.get("apikey")
-        if not key:
-            log_warning_and_ip(
-                T("API Key missing, please enter the api key from Config->General into your 3rd party program:")
-            )
-            return _MSG_APIKEY_REQUIRED
-        elif req_access == 1 and key == cfg.nzb_key():
-            return None
-        elif key == cfg.api_key():
-            return None
-        else:
-            log_warning_and_ip(T("API Key incorrect, Use the api key from Config->General in your 3rd party program:"))
-            return _MSG_APIKEY_INCORRECT
+    key = kwargs.get("apikey")
+    if not key:
+        log_warning_and_ip(
+            T("API Key missing, please enter the api key from Config->General into your 3rd party program:")
+        )
+        return _MSG_APIKEY_REQUIRED
+    elif req_access == 1 and key == cfg.nzb_key():
+        return None
+    elif key == cfg.api_key():
+        return None
+    else:
+        log_warning_and_ip(T("API Key incorrect, Use the api key from Config->General in your 3rd party program:"))
+        return _MSG_APIKEY_INCORRECT
 
-    # No active API-key, check web credentials instead
-    if cfg.username() and cfg.password():
-        if check_login() or (
-            kwargs.get("ma_username") == cfg.username() and kwargs.get("ma_password") == cfg.password()
-        ):
-            pass
-        else:
-            log_warning_and_ip(
-                T(
-                    "Authentication missing, please enter username/password from Config->General into your 3rd party program:"
-                )
-            )
-            return _MSG_MISSING_AUTH
-    return None
+
+def template_filtered_response(file: str, search_list: Dict[str, Any]):
+    """Wrapper for Cheetah response"""
+    # We need a copy, because otherwise source-dicts might be modified
+    search_list_copy = copy.deepcopy(search_list)
+    # 'filters' is excluded because the RSS-filters are listed twice
+    recursive_html_escape(search_list_copy, exclude_items=("webdir", "filters"))
+    return Template(file=file, searchList=[search_list_copy], compilerSettings=CHEETAH_DIRECTIVES).respond()
 
 
 def log_warning_and_ip(txt):
@@ -378,9 +395,8 @@ def Raiser(root: str = "", **kwargs):
     if kwargs:
         root = "%s?%s" % (root, urllib.parse.urlencode(kwargs))
 
-    # Optionally add the leading /sabnzbd/ (or what the user set)
-    if not root.startswith(cfg.url_base()):
-        root = cherrypy.request.script_name + root
+    # Add the leading /sabnzbd/ (or what the user set)
+    root = cfg.url_base() + root
 
     # Log the redirect
     if cfg.api_logging():
@@ -415,6 +431,10 @@ class MainPage:
             info["have_rss_defined"] = bool(config.get_rss())
             info["have_watched_dir"] = bool(cfg.dirscan_dir())
 
+            info["cpumodel"] = get_cpu_name()
+            info["cpusimd"] = sabnzbd.decoder.SABCTOOLS_SIMD
+            info["platform"] = sabnzbd.PLATFORM
+
             # Have logout only with HTML and if inet=5, only when we are external
             info["have_logout"] = (
                 cfg.username()
@@ -428,10 +448,7 @@ class MainPage:
             bytespersec_list = sabnzbd.BPSMeter.get_bps_list()
             info["bytespersec_list"] = ",".join([str(bps) for bps in bytespersec_list])
 
-            template = Template(
-                file=os.path.join(sabnzbd.WEB_DIR, "main.tmpl"), searchList=[info], compilerSettings=CHEETAH_DIRECTIVES
-            )
-            return template.respond()
+            return template_filtered_response(file=os.path.join(sabnzbd.WEB_DIR, "main.tmpl"), search_list=info)
         else:
             # Redirect to the setup wizard
             raise cherrypy.HTTPRedirect("%s/wizard/" % cfg.url_base())
@@ -455,8 +472,7 @@ class MainPage:
     def scriptlog(self, **kwargs):
         """Needed for all skins, URL is fixed due to postproc"""
         # No session key check, due to fixed URLs
-        name = kwargs.get("name")
-        if name:
+        if name := kwargs.get("name"):
             history_db = sabnzbd.get_db_connection()
             return ShowString(history_db.get_name(name), history_db.get_script_log(name))
         else:
@@ -486,7 +502,7 @@ class Wizard:
     @secured_expose(check_configlock=True)
     def index(self, **kwargs):
         """Show the language selection page"""
-        if sabnzbd.WIN32:
+        if sabnzbd.WINDOWS:
             from sabnzbd.utils.apireg import get_install_lng
 
             cfg.language.set(get_install_lng())
@@ -494,10 +510,8 @@ class Wizard:
 
         info = build_header(sabnzbd.WIZARD_DIR)
         info["languages"] = list_languages()
-        template = Template(
-            file=os.path.join(sabnzbd.WIZARD_DIR, "index.html"), searchList=[info], compilerSettings=CHEETAH_DIRECTIVES
-        )
-        return template.respond()
+
+        return template_filtered_response(file=os.path.join(sabnzbd.WIZARD_DIR, "index.html"), search_list=info)
 
     @secured_expose(check_configlock=True)
     def one(self, **kwargs):
@@ -505,21 +519,18 @@ class Wizard:
         if kwargs.get("lang"):
             cfg.language.set(kwargs.get("lang"))
 
-        # Always setup Glitter
-        change_web_dir("Glitter - Auto")
-
         info = build_header(sabnzbd.WIZARD_DIR)
-        info["certificate_validation"] = sabnzbd.CERTIFICATE_VALIDATION
 
         # Just in case, add server
         servers = config.get_servers()
         if not servers:
+            info["server"] = ""
             info["host"] = ""
             info["port"] = ""
             info["username"] = ""
             info["password"] = ""
             info["connections"] = ""
-            info["ssl"] = 0
+            info["ssl"] = 1
             info["ssl_verify"] = 2
         else:
             # Sort servers to get the first enabled one
@@ -531,6 +542,7 @@ class Wizard:
             for server in server_names:
                 # If there are multiple servers, just use the first enabled one
                 s = servers[server]
+                info["server"] = server
                 info["host"] = s.host()
                 info["port"] = s.port()
                 info["username"] = s.username()
@@ -540,10 +552,7 @@ class Wizard:
                 info["ssl_verify"] = s.ssl_verify()
                 if s.enable():
                     break
-        template = Template(
-            file=os.path.join(sabnzbd.WIZARD_DIR, "one.html"), searchList=[info], compilerSettings=CHEETAH_DIRECTIVES
-        )
-        return template.respond()
+        return template_filtered_response(file=os.path.join(sabnzbd.WIZARD_DIR, "one.html"), search_list=info)
 
     @secured_expose(check_configlock=True)
     def two(self, **kwargs):
@@ -562,34 +571,32 @@ class Wizard:
         info["download_dir"] = cfg.download_dir.get_clipped_path()
         info["complete_dir"] = cfg.complete_dir.get_clipped_path()
 
-        template = Template(
-            file=os.path.join(sabnzbd.WIZARD_DIR, "two.html"), searchList=[info], compilerSettings=CHEETAH_DIRECTIVES
-        )
-        return template.respond()
+        return template_filtered_response(file=os.path.join(sabnzbd.WIZARD_DIR, "two.html"), search_list=info)
 
 
 def get_access_info():
     """Build up a list of url's that sabnzbd can be accessed from"""
     # Access_url is used to provide the user a link to SABnzbd depending on the host
-    cherryhost = cfg.cherryhost()
+    web_host = cfg.web_host()
     host = socket.gethostname().lower()
+    logging.info("hostname is", host)
     socks = [host]
 
-    if cherryhost == "0.0.0.0":
+    try:
+        addresses = socket.getaddrinfo(host, None)
+    except:
+        addresses = []
+
+    if web_host == "0.0.0.0":
         # Grab a list of all ips for the hostname
-        try:
-            addresses = socket.getaddrinfo(host, None)
-        except:
-            addresses = []
         for addr in addresses:
             address = addr[4][0]
             # Filter out ipv6 addresses (should not be allowed)
             if ":" not in address and address not in socks:
                 socks.append(address)
         socks.insert(0, "localhost")
-    elif cherryhost == "::":
+    elif web_host == "::":
         # Grab a list of all ips for the hostname
-        addresses = socket.getaddrinfo(host, None)
         for addr in addresses:
             address = addr[4][0]
             # Only ipv6 addresses will work
@@ -598,8 +605,8 @@ def get_access_info():
                 if address not in socks:
                     socks.append(address)
         socks.insert(0, "localhost")
-    elif cherryhost:
-        socks = [cherryhost]
+    elif web_host:
+        socks = [web_host]
 
     # Add the current requested URL as the base
     access_url = urllib.parse.urljoin(cherrypy.request.base, cfg.url_base())
@@ -610,9 +617,9 @@ def get_access_info():
             if cfg.enable_https() and cfg.https_port():
                 url = "https://%s:%s%s" % (sock, cfg.https_port(), cfg.url_base())
             elif cfg.enable_https():
-                url = "https://%s:%s%s" % (sock, cfg.cherryport(), cfg.url_base())
+                url = "https://%s:%s%s" % (sock, cfg.web_port(), cfg.url_base())
             else:
-                url = "http://%s:%s%s" % (sock, cfg.cherryport(), cfg.url_base())
+                url = "http://%s:%s%s" % (sock, cfg.web_port(), cfg.url_base())
             urls.append(url)
 
     # Return a unique list
@@ -634,7 +641,7 @@ class LoginPage:
 
         # Check if there's even a username/password set
         if check_login():
-            raise Raiser(cherrypy.request.script_name + "/")
+            raise Raiser("/")
 
         # Check login info
         if kwargs.get("username") == cfg.username() and kwargs.get("password") == cfg.password():
@@ -643,19 +650,17 @@ class LoginPage:
             # Log the success
             logging.info("Successful login from %s", cherrypy.request.remote_label)
             # Redirect
-            raise Raiser(cherrypy.request.script_name + "/")
+            raise Raiser("/")
         elif kwargs.get("username") or kwargs.get("password"):
             info["error"] = T("Authentication failed, check username/password.")
             # Warn about the potential security problem
             logging.warning(T("Unsuccessful login attempt from %s"), cherrypy.request.remote_label)
 
         # Show login
-        template = Template(
+        return template_filtered_response(
             file=os.path.join(sabnzbd.WEB_DIR_CONFIG, "login", "main.tmpl"),
-            searchList=[info],
-            compilerSettings=CHEETAH_DIRECTIVES,
+            search_list=info,
         )
-        return template.respond()
 
 
 ##############################################################################
@@ -679,21 +684,14 @@ class ConfigPage:
         conf["configfn"] = clip_path(config.get_filename())
         conf["cmdline"] = sabnzbd.CMDLINE
         conf["build"] = sabnzbd.__baseline__[:7]
-
-        conf["have_unzip"] = bool(sabnzbd.newsunpack.ZIP_COMMAND)
-        conf["have_7zip"] = bool(sabnzbd.newsunpack.SEVEN_COMMAND)
-        conf["have_sabyenc"] = sabnzbd.decoder.SABYENC_ENABLED
-        conf["have_mt_par2"] = sabnzbd.newsunpack.PAR2_MT
-
-        conf["certificate_validation"] = sabnzbd.CERTIFICATE_VALIDATION
+        conf["have_7zip"] = bool(sabnzbd.newsunpack.SEVENZIP_COMMAND)
+        conf["have_par2_turbo"] = sabnzbd.newsunpack.PAR2_TURBO
         conf["ssl_version"] = ssl.OPENSSL_VERSION
 
-        template = Template(
+        return template_filtered_response(
             file=os.path.join(sabnzbd.WEB_DIR_CONFIG, "config.tmpl"),
-            searchList=[conf],
-            compilerSettings=CHEETAH_DIRECTIVES,
+            search_list=conf,
         )
-        return template.respond()
 
 
 ##############################################################################
@@ -710,6 +708,7 @@ LIST_DIRPAGE = (
     "email_dir",
     "permissions",
     "log_dir",
+    "backup_dir",
     "password_file",
 )
 
@@ -724,34 +723,22 @@ class ConfigFolders:
     def index(self, **kwargs):
         conf = build_header(sabnzbd.WEB_DIR_CONFIG)
 
+        conf["file_exts"] = ", ".join(VALID_NZB_FILES + VALID_ARCHIVES)
+
         for kw in LIST_DIRPAGE + LIST_BOOL_DIRPAGE:
             conf[kw] = config.get_config("misc", kw)()
 
-        template = Template(
+        return template_filtered_response(
             file=os.path.join(sabnzbd.WEB_DIR_CONFIG, "config_folders.tmpl"),
-            searchList=[conf],
-            compilerSettings=CHEETAH_DIRECTIVES,
+            search_list=conf,
         )
-        return template.respond()
 
     @secured_expose(check_api_key=True, check_configlock=True)
     def saveDirectories(self, **kwargs):
         for kw in LIST_DIRPAGE + LIST_BOOL_DIRPAGE:
-            value = kwargs.get(kw)
-            if value is not None or kw in LIST_BOOL_DIRPAGE:
-                if kw in ("complete_dir", "dirscan_dir"):
-                    msg = config.get_config("misc", kw).set(value, create=True)
-                else:
-                    msg = config.get_config("misc", kw).set(value)
-                if msg:
-                    # return sabnzbd.api.report('json', error=msg)
-                    return badParameterResponse(msg, kwargs.get("ajax"))
+            if msg := config.get_config("misc", kw).set(kwargs.get(kw)):
+                return badParameterResponse(msg, kwargs.get("ajax"))
 
-        if not sabnzbd.check_incomplete_vs_complete():
-            return badParameterResponse(
-                T("The Completed Download Folder cannot be the same or a subfolder of the Temporary Download Folder"),
-                kwargs.get("ajax"),
-            )
         config.save_config()
         if kwargs.get("ajax"):
             return sabnzbd.api.report()
@@ -764,7 +751,6 @@ SWITCH_LIST = (
     "par_option",
     "top_only",
     "direct_unpack",
-    "enable_meta",
     "win_process_prio",
     "auto_sort",
     "propagation_delay",
@@ -772,6 +758,7 @@ SWITCH_LIST = (
     "flat_unpack",
     "safe_postproc",
     "no_dupes",
+    "replace_underscores",
     "replace_spaces",
     "replace_dots",
     "ignore_samples",
@@ -779,48 +766,30 @@ SWITCH_LIST = (
     "nice",
     "ionice",
     "pre_script",
+    "end_queue_script",
     "pause_on_pwrar",
     "sfv_check",
     "deobfuscate_final_filenames",
     "folder_rename",
-    "load_balancing",
     "quota_size",
     "quota_day",
     "quota_resume",
     "quota_period",
-    "history_retention",
+    "history_retention_option",
+    "history_retention_number",
     "pre_check",
     "max_art_tries",
     "fail_hopeless_jobs",
     "enable_all_par",
     "enable_recursive",
-    "no_series_dupes",
-    "series_propercheck",
+    "no_smart_dupes",
+    "dupes_propercheck",
     "script_can_fail",
-    "new_nzb_on_failure",
     "unwanted_extensions",
     "action_on_unwanted_extensions",
     "unwanted_extensions_mode",
+    "cleanup_list",
     "sanitize_safe",
-    "rating_enable",
-    "rating_api_key",
-    "rating_filter_enable",
-    "rating_filter_abort_audio",
-    "rating_filter_abort_video",
-    "rating_filter_abort_encrypted",
-    "rating_filter_abort_encrypted_confirm",
-    "rating_filter_abort_spam",
-    "rating_filter_abort_spam_confirm",
-    "rating_filter_abort_downvoted",
-    "rating_filter_abort_keywords",
-    "rating_filter_pause_audio",
-    "rating_filter_pause_video",
-    "rating_filter_pause_encrypted",
-    "rating_filter_pause_encrypted_confirm",
-    "rating_filter_pause_spam",
-    "rating_filter_pause_spam_confirm",
-    "rating_filter_pause_downvoted",
-    "rating_filter_pause_keywords",
 )
 
 
@@ -831,40 +800,26 @@ class ConfigSwitches:
     @secured_expose(check_configlock=True)
     def index(self, **kwargs):
         conf = build_header(sabnzbd.WEB_DIR_CONFIG)
-
-        conf["certificate_validation"] = sabnzbd.CERTIFICATE_VALIDATION
         conf["have_nice"] = bool(sabnzbd.newsunpack.NICE_COMMAND)
         conf["have_ionice"] = bool(sabnzbd.newsunpack.IONICE_COMMAND)
-        conf["cleanup_list"] = cfg.cleanup_list.get_string()
 
         for kw in SWITCH_LIST:
             conf[kw] = config.get_config("misc", kw)()
+        conf["cleanup_list"] = cfg.cleanup_list.get_string()
         conf["unwanted_extensions"] = cfg.unwanted_extensions.get_string()
 
         conf["scripts"] = list_scripts() or ["None"]
 
-        template = Template(
+        return template_filtered_response(
             file=os.path.join(sabnzbd.WEB_DIR_CONFIG, "config_switches.tmpl"),
-            searchList=[conf],
-            compilerSettings=CHEETAH_DIRECTIVES,
+            search_list=conf,
         )
-        return template.respond()
 
     @secured_expose(check_api_key=True, check_configlock=True)
     def saveSwitches(self, **kwargs):
         for kw in SWITCH_LIST:
-            item = config.get_config("misc", kw)
-            value = kwargs.get(kw)
-            if kw == "unwanted_extensions" and value:
-                value = value.lower().replace(".", "")
-            msg = item.set(value)
-            if msg:
+            if msg := config.get_config("misc", kw).set(kwargs.get(kw)):
                 return badParameterResponse(msg, kwargs.get("ajax"))
-
-        cleanup_list = kwargs.get("cleanup_list")
-        if cleanup_list and sabnzbd.WIN32:
-            cleanup_list = cleanup_list.lower()
-        cfg.cleanup_list.set(cleanup_list)
 
         config.save_config()
         if kwargs.get("ajax"):
@@ -876,57 +831,55 @@ class ConfigSwitches:
 ##############################################################################
 SPECIAL_BOOL_LIST = (
     "start_paused",
+    "preserve_paused_state",
     "no_penalties",
+    "ipv6_servers",
+    "ipv6_staging",
     "fast_fail",
     "overwrite_files",
     "enable_par_cleanup",
     "process_unpacked_par2",
     "queue_complete_pers",
     "api_warnings",
-    "helpfull_warnings",
+    "helpful_warnings",
     "ampm",
     "enable_unrar",
-    "enable_unzip",
     "enable_7zip",
     "enable_filejoin",
     "enable_tsjoin",
     "ignore_unrar_dates",
-    "osx_menu",
-    "osx_speed",
-    "win_menu",
+    "tray_icon",
     "allow_incomplete_nzb",
     "rss_filenames",
     "ipv6_hosting",
     "keep_awake",
     "empty_postproc",
+    "new_nzb_on_failure",
     "html_login",
+    "disable_archive",
     "wait_for_dfolder",
     "enable_broadcast",
     "warn_dupl_jobs",
-    "replace_illegal",
     "backup_for_duplicates",
-    "disable_api_key",
     "api_logging",
     "x_frame_options",
     "allow_old_ssl_tls",
+    "enable_season_sorting",
+    "verify_xff_header",
 )
 SPECIAL_VALUE_LIST = (
     "downloader_sleep_time",
     "size_limit",
-    "movie_rename_limit",
-    "episode_rename_limit",
     "nomedia_marker",
     "max_url_retries",
     "req_completion_rate",
     "wait_ext_drive",
     "max_foldername_length",
-    "show_sysload",
     "url_base",
-    "num_decoders",
+    "receive_threads",
+    "switchinterval",
     "direct_unpack_threads",
-    "ipv6_servers",
     "selftest_host",
-    "rating_host",
     "ssdp_broadcast_interval",
 )
 SPECIAL_LIST_LIST = (
@@ -934,6 +887,7 @@ SPECIAL_LIST_LIST = (
     "quick_check_ext_ignore",
     "host_whitelist",
     "local_ranges",
+    "ext_rename_ignore",
 )
 
 
@@ -945,10 +899,10 @@ class ConfigSpecial:
     def index(self, **kwargs):
         conf = build_header(sabnzbd.WEB_DIR_CONFIG)
         conf["switches"] = [
-            (kw, config.get_config("misc", kw)(), config.get_config("misc", kw).default()) for kw in SPECIAL_BOOL_LIST
+            (kw, config.get_config("misc", kw)(), config.get_config("misc", kw).default) for kw in SPECIAL_BOOL_LIST
         ]
         conf["entries"] = [
-            (kw, config.get_config("misc", kw)(), config.get_config("misc", kw).default()) for kw in SPECIAL_VALUE_LIST
+            (kw, config.get_config("misc", kw)(), config.get_config("misc", kw).default) for kw in SPECIAL_VALUE_LIST
         ]
         conf["entries"].extend(
             [
@@ -957,20 +911,15 @@ class ConfigSpecial:
             ]
         )
 
-        template = Template(
+        return template_filtered_response(
             file=os.path.join(sabnzbd.WEB_DIR_CONFIG, "config_special.tmpl"),
-            searchList=[conf],
-            compilerSettings=CHEETAH_DIRECTIVES,
+            search_list=conf,
         )
-        return template.respond()
 
     @secured_expose(check_api_key=True, check_configlock=True)
     def saveSpecial(self, **kwargs):
         for kw in SPECIAL_BOOL_LIST + SPECIAL_VALUE_LIST + SPECIAL_LIST_LIST:
-            item = config.get_config("misc", kw)
-            value = kwargs.get(kw)
-            msg = item.set(value)
-            if msg:
+            if msg := config.get_config("misc", kw).set(kwargs.get(kw)):
                 return badParameterResponse(msg)
 
         config.save_config()
@@ -982,7 +931,6 @@ GENERAL_LIST = (
     "host",
     "port",
     "username",
-    "refresh_rate",
     "language",
     "cache_limit",
     "inet_exposure",
@@ -995,6 +943,8 @@ GENERAL_LIST = (
     "socks5_proxy_url",
     "auto_browser",
     "check_new_rel",
+    "bandwidth_max",
+    "bandwidth_perc",
 )
 
 
@@ -1004,16 +954,12 @@ class ConfigGeneral:
 
     @secured_expose(check_configlock=True)
     def index(self, **kwargs):
-
         conf = build_header(sabnzbd.WEB_DIR_CONFIG)
-
-        conf["configfn"] = config.get_filename()
-        conf["certificate_validation"] = sabnzbd.CERTIFICATE_VALIDATION
 
         web_list = []
         for interface_dir in globber_full(sabnzbd.DIR_INTERFACES):
             # Ignore the config
-            if not interface_dir.endswith(DEF_STDCONFIG):
+            if not interface_dir.endswith(DEF_STD_CONFIG):
                 # Check the available templates
                 for colorscheme in globber(
                     os.path.join(interface_dir, "templates", "static", "stylesheets", "colorschemes")
@@ -1026,47 +972,31 @@ class ConfigGeneral:
 
         conf["language"] = cfg.language()
         conf["lang_list"] = list_languages()
+        conf["def_https_cert_file"] = DEF_HTTPS_CERT_FILE
 
         for kw in GENERAL_LIST:
             conf[kw] = config.get_config("misc", kw)()
 
-        conf["bandwidth_max"] = cfg.bandwidth_max()
-        conf["bandwidth_perc"] = cfg.bandwidth_perc()
         conf["nzb_key"] = cfg.nzb_key()
         conf["caller_url"] = cherrypy.request.base + cfg.url_base()
 
-        template = Template(
+        return template_filtered_response(
             file=os.path.join(sabnzbd.WEB_DIR_CONFIG, "config_general.tmpl"),
-            searchList=[conf],
-            compilerSettings=CHEETAH_DIRECTIVES,
+            search_list=conf,
         )
-        return template.respond()
 
     @secured_expose(check_api_key=True, check_configlock=True)
     def saveGeneral(self, **kwargs):
         # Handle general options
         for kw in GENERAL_LIST:
-            item = config.get_config("misc", kw)
-            value = kwargs.get(kw)
-            msg = item.set(value)
-            if msg:
-                return badParameterResponse(msg)
+            if msg := config.get_config("misc", kw).set(kwargs.get(kw)):
+                return badParameterResponse(msg, ajax=kwargs.get("ajax"))
 
         # Handle special options
         cfg.password.set(kwargs.get("password"))
 
         web_dir = kwargs.get("web_dir")
         change_web_dir(web_dir)
-
-        bandwidth_max = kwargs.get("bandwidth_max")
-        if bandwidth_max is not None:
-            cfg.bandwidth_max.set(bandwidth_max)
-        bandwidth_perc = kwargs.get("bandwidth_perc")
-        if bandwidth_perc is not None:
-            cfg.bandwidth_perc.set(bandwidth_perc)
-        bandwidth_perc = cfg.bandwidth_perc()
-        if bandwidth_perc and not bandwidth_max:
-            logging.warning_helpful(T("You must set a maximum bandwidth before you can set a bandwidth limit"))
 
         config.save_config()
 
@@ -1076,6 +1006,22 @@ class ConfigGeneral:
             return sabnzbd.api.report(data={"success": True, "restart_req": sabnzbd.RESTART_REQ})
         else:
             raise Raiser(self.__root)
+
+    @secured_expose(check_api_key=True, check_configlock=True)
+    def uploadConfig(self, **kwargs):
+        """Restore a config backup"""
+        config_backup_file = kwargs.get("config_backup_file")
+
+        # Only accept the backup file if it can be opened as a zip archive and only contains a config file
+        try:
+            config_backup_data = config_backup_file.file.read()
+            config_backup_file.file.close()
+            if config.validate_config_backup(config_backup_data):
+                sabnzbd.RESTORE_DATA = config_backup_data
+                return sabnzbd.api.report(data={"success": True, "restart_req": True})
+        except:
+            pass
+        return sabnzbd.api.report(error=T("Invalid backup archive"))
 
 
 def change_web_dir(web_dir):
@@ -1105,7 +1051,7 @@ class ConfigServer:
             % (int(not servers[svr].enable()), servers[svr].priority(), servers[svr].displayname().lower()),
         )
         for svr in server_names:
-            new.append(servers[svr].get_dict(safe=True))
+            new.append(servers[svr].get_dict(for_public_api=True))
             t, m, w, d, daily, articles_tried, articles_success = sabnzbd.BPSMeter.amounts(svr)
             if t:
                 new[-1]["amounts"] = (
@@ -1123,14 +1069,11 @@ class ConfigServer:
 
         conf["servers"] = new
         conf["cats"] = list_cats(default=True)
-        conf["certificate_validation"] = sabnzbd.CERTIFICATE_VALIDATION
 
-        template = Template(
+        return template_filtered_response(
             file=os.path.join(sabnzbd.WEB_DIR_CONFIG, "config_server.tmpl"),
-            searchList=[conf],
-            compilerSettings=CHEETAH_DIRECTIVES,
+            search_list=conf,
         )
-        return template.respond()
 
     @secured_expose(check_api_key=True, check_configlock=True)
     def addServer(self, **kwargs):
@@ -1139,11 +1082,6 @@ class ConfigServer:
     @secured_expose(check_api_key=True, check_configlock=True)
     def saveServer(self, **kwargs):
         return handle_server(kwargs, self.__root)
-
-    @secured_expose(check_api_key=True, check_configlock=True)
-    def testServer(self, **kwargs):
-        _, msg = test_nntp_server_dict(kwargs)
-        return msg
 
     @secured_expose(check_api_key=True, check_configlock=True)
     def delServer(self, **kwargs):
@@ -1186,17 +1124,6 @@ def unique_svr_name(server):
     return new_name
 
 
-def check_server(host, port, ajax):
-    """Check if server address resolves properly"""
-    if host.lower() == "localhost" and sabnzbd.AMBI_LOCALHOST:
-        return badParameterResponse(T("Warning: LOCALHOST is ambiguous, use numerical IP-address."), ajax)
-
-    if get_server_addrinfo(host, int_conv(port)):
-        return ""
-    else:
-        return badParameterResponse(T('Server address "%s:%s" is not valid.') % (host, port), ajax)
-
-
 def handle_server(kwargs, root=None, new_svr=False):
     """Internal server handler"""
     ajax = kwargs.get("ajax")
@@ -1216,9 +1143,10 @@ def handle_server(kwargs, root=None, new_svr=False):
         kwargs["connections"] = "1"
 
     if kwargs.get("enable") == "1":
-        msg = check_server(host, port, ajax)
-        if msg:
-            return msg
+        if not happyeyeballs(
+            host, int_conv(port), int_conv(kwargs.get("timeout"), default=DEF_NETWORKING_TEST_TIMEOUT)
+        ):
+            return badParameterResponse(T('Server address "%s:%s" is not valid.') % (host, port), ajax)
 
     # Default server name is just the host name
     server = host
@@ -1235,7 +1163,7 @@ def handle_server(kwargs, root=None, new_svr=False):
     if new_svr:
         server = unique_svr_name(server)
 
-    for kw in ("ssl", "send_group", "enable", "required", "optional"):
+    for kw in ("ssl", "enable", "required", "optional"):
         if kw not in kwargs.keys():
             kwargs[kw] = None
     if svr and not new_svr:
@@ -1335,12 +1263,10 @@ class ConfigRss:
             unum += 1
         conf["feed"] = txt + str(unum)
 
-        template = Template(
+        return template_filtered_response(
             file=os.path.join(sabnzbd.WEB_DIR_CONFIG, "config_rss.tmpl"),
-            searchList=[conf],
-            compilerSettings=CHEETAH_DIRECTIVES,
+            search_list=conf,
         )
-        return template.respond()
 
     @secured_expose(check_api_key=True, check_configlock=True)
     def save_rss_rate(self, **kwargs):
@@ -1389,9 +1315,8 @@ class ConfigRss:
             # Did we get a new name for this feed?
             new_name = kwargs.get("feed_new_name")
             if new_name and new_name != feed_name:
-                cf.rename(new_name)
                 # Update the feed name for the redirect
-                kwargs["feed"] = new_name
+                kwargs["feed"] = cf.rename(new_name)
 
             config.save_config()
 
@@ -1454,7 +1379,7 @@ class ConfigRss:
             raise rssRaiser(self.__root, kwargs)
 
         pp = kwargs.get("pp", "")
-        if pp.lower() == "none":
+        if is_none(pp):
             pp = ""
         script = ConvertSpecials(kwargs.get("script"))
         cat = ConvertSpecials(kwargs.get("cat"))
@@ -1464,7 +1389,7 @@ class ConfigRss:
 
         if filt:
             feed_cfg.filters.update(
-                int(kwargs.get("index", 0)), (cat, pp, script, kwargs.get("filter_type"), filt, prio, enabled)
+                int(kwargs.get("index", 0)), [cat, pp, script, kwargs.get("filter_type"), filt, prio, enabled]
             )
 
             # Move filter if requested
@@ -1554,16 +1479,24 @@ class ConfigRss:
         """Download NZB from provider (Download button)"""
         feed = kwargs.get("feed")
         url = kwargs.get("url")
-        nzbname = kwargs.get("nzbname")
-        att = sabnzbd.RSSReader.lookup_url(feed, url)
-        if att:
+        if att := sabnzbd.RSSReader.lookup_url(feed, url):
+            nzbname = kwargs.get("nzbname")
             pp = att.get("pp")
             cat = att.get("cat")
             script = att.get("script")
-            prio = att.get("prio")
+            priority = att.get("prio")
 
             if url:
-                sabnzbd.add_url(url, pp, script, cat, prio, nzbname)
+                logging.info("Adding %s (%s) to queue", url, nzbname)
+                sabnzbd.urlgrabber.add_url(
+                    url,
+                    pp=pp,
+                    script=script,
+                    cat=cat,
+                    priority=priority,
+                    nzbname=nzbname,
+                    nzo_info={"RSS": feed},
+                )
             # Need to pass the title instead
             sabnzbd.RSSReader.flag_downloaded(feed, url)
         raise rssRaiser(self.__root, kwargs)
@@ -1604,6 +1537,7 @@ _SCHED_ACTIONS = (
     "resume_post",
     "scan_folder",
     "rss_scan",
+    "create_backup",
     "remove_failed",
     "remove_completed",
     "pause_all_low",
@@ -1710,12 +1644,10 @@ class ConfigScheduling:
         conf["actions_lng"] = actions_lng
         conf["categories"] = categories
 
-        template = Template(
+        return template_filtered_response(
             file=os.path.join(sabnzbd.WEB_DIR_CONFIG, "config_scheduling.tmpl"),
-            searchList=[conf],
-            compilerSettings=CHEETAH_DIRECTIVES,
+            search_list=conf,
         )
-        return template.respond()
 
     @secured_expose(check_api_key=True, check_configlock=True)
     def addSchedule(self, **kwargs):
@@ -1806,32 +1738,25 @@ class ConfigCats:
         conf["defdir"] = cfg.complete_dir.get_clipped_path()
 
         categories = config.get_ordered_categories()
-        conf["have_cats"] = len(categories) > 1
+        new_cat_order = max(cat["order"] for cat in categories) + 1
 
-        slotinfo = []
-        for cat in categories:
-            cat["newzbin"] = cat["newzbin"].replace('"', "&quot;")
-            slotinfo.append(cat)
-
-        # Add empty line
+        # Add empty line to add new categories
         empty = {
             "name": "",
-            "order": "0",
+            "order": str(new_cat_order),
             "pp": "-1",
             "script": "",
             "dir": "",
             "newzbin": "",
             "priority": DEFAULT_PRIORITY,
         }
-        slotinfo.insert(1, empty)
-        conf["slotinfo"] = slotinfo
+        categories.insert(1, empty)
+        conf["slotinfo"] = categories
 
-        template = Template(
+        return template_filtered_response(
             file=os.path.join(sabnzbd.WEB_DIR_CONFIG, "config_cat.tmpl"),
-            searchList=[conf],
-            compilerSettings=CHEETAH_DIRECTIVES,
+            search_list=conf,
         )
-        return template.respond()
 
     @secured_expose(check_api_key=True, check_configlock=True)
     def delete(self, **kwargs):
@@ -1843,13 +1768,13 @@ class ConfigCats:
     @secured_expose(check_api_key=True, check_configlock=True)
     def save(self, **kwargs):
         name = kwargs.get("name", "*")
+        newname = kwargs.get("newname", "")
         if name == "*":
             newname = name
-        else:
-            newname = re.sub('"', "", kwargs.get("newname", ""))
+
         if newname:
             # Check if this cat-dir is not sub-folder of incomplete
-            if same_file(cfg.download_dir.get_path(), real_path(cfg.complete_dir.get_path(), kwargs["dir"])):
+            if same_directory(cfg.download_dir.get_path(), real_path(cfg.complete_dir.get_path(), kwargs["dir"])):
                 return T("Category folder cannot be a subfolder of the Temporary Download Folder.")
 
             # Delete current one and replace with new one
@@ -1862,21 +1787,6 @@ class ConfigCats:
 
 
 ##############################################################################
-SORT_LIST = (
-    "enable_tv_sorting",
-    "tv_sort_string",
-    "tv_categories",
-    "enable_movie_sorting",
-    "movie_sort_string",
-    "movie_sort_extra",
-    "movie_extra_folder",
-    "enable_date_sorting",
-    "date_sort_string",
-    "movie_categories",
-    "date_categories",
-)
-
-
 class ConfigSorting:
     def __init__(self, root):
         self.__root = root
@@ -1884,32 +1794,66 @@ class ConfigSorting:
     @secured_expose(check_configlock=True)
     def index(self, **kwargs):
         conf = build_header(sabnzbd.WEB_DIR_CONFIG)
-        conf["complete_dir"] = cfg.complete_dir.get_clipped_path()
 
-        for kw in SORT_LIST:
-            conf[kw] = config.get_config("misc", kw)()
+        sorters = config.get_ordered_sorters()
+        # Add empty sorter entry, used as a template at the top of the page
+        empty = {
+            "is_active": "1",
+            "name": "",
+            "order": len(sorters),  # Last in line
+            "min_size": DEF_SORTER_RENAME_SIZE,
+            "sort_string": "",
+            "sort_cats": "",
+            "sort_type": "0,",
+            "multipart_label": "",
+        }
+        sorters.insert(0, empty)
+        conf["slotinfo"] = sorters
         conf["categories"] = list_cats(False)
         conf["guessit_properties"] = tuple(
             prop for prop in guessit_properties().keys() if prop not in EXCLUDED_GUESSIT_PROPERTIES
         )
+        conf["sort_types"] = GUESSIT_SORT_TYPES
 
-        template = Template(
+        return template_filtered_response(
             file=os.path.join(sabnzbd.WEB_DIR_CONFIG, "config_sorting.tmpl"),
-            searchList=[conf],
-            compilerSettings=CHEETAH_DIRECTIVES,
+            search_list=conf,
         )
-        return template.respond()
 
     @secured_expose(check_api_key=True, check_configlock=True)
-    def saveSorting(self, **kwargs):
-        for kw in SORT_LIST:
-            item = config.get_config("misc", kw)
-            value = kwargs.get(kw)
-            msg = item.set(value)
-            if msg:
-                return badParameterResponse(msg)
+    def delete(self, **kwargs):
+        kwargs["section"] = "sorters"
+        kwargs["keyword"] = kwargs.get("name")
+        del_from_section(kwargs)
+        raise Raiser(self.__root)
+
+    @secured_expose(check_api_key=True, check_configlock=True)
+    def save_sorter(self, **kwargs):
+        name = kwargs.get("name", "*")
+        newname = kwargs.get("newname", "")
+        newname = config.clean_section_name(newname)
+
+        if name == "*":
+            newname = name
+        if newname:
+            # Delete current one and replace with new one
+            if name:
+                config.delete("sorters", name)
+            config.ConfigSorter(newname, kwargs)
 
         config.save_config()
+        raise Raiser(self.__root)
+
+    @secured_expose(check_api_key=True, check_configlock=True)
+    def toggle_sorter(self, **kwargs):
+        """Toggle is_active flag of a sorter"""
+        try:
+            sorter = config.get_sorters()[kwargs.get("sorter")]
+            sorter.is_active.set(not sorter.is_active())
+            config.save_config()
+        except Exception:
+            pass
+
         raise Raiser(self.__root)
 
 
@@ -1993,7 +1937,7 @@ def GetRssLog(feed):
 
         # And we add extra fields for sorting
         if job.get("age", 0):
-            job["age_ms"] = (job["age"] - datetime.utcfromtimestamp(0)).total_seconds()
+            job["age_ms"] = (job["age"] - datetime.datetime(1970, 1, 1)).total_seconds()
             job["age"] = calc_age(job["age"], True)
         else:
             job["age_ms"] = ""
@@ -2148,6 +2092,35 @@ NOTIFY_OPTIONS = {
         "pushbullet_prio_other",
         "pushbullet_prio_new_login",
     ),
+    "apprise": (
+        "apprise_enable",
+        "apprise_cats",
+        "apprise_urls",
+        "apprise_target_startup",
+        "apprise_target_startup_enable",
+        "apprise_target_download",
+        "apprise_target_download_enable",
+        "apprise_target_pause_resume",
+        "apprise_target_pause_resume_enable",
+        "apprise_target_pp",
+        "apprise_target_pp_enable",
+        "apprise_target_complete",
+        "apprise_target_complete_enable",
+        "apprise_target_failed",
+        "apprise_target_failed_enable",
+        "apprise_target_disk_full",
+        "apprise_target_disk_full_enable",
+        "apprise_target_warning",
+        "apprise_target_warning_enable",
+        "apprise_target_error",
+        "apprise_target_error_enable",
+        "apprise_target_queue_done",
+        "apprise_target_queue_done_enable",
+        "apprise_target_other",
+        "apprise_target_other_enable",
+        "apprise_target_new_login",
+        "apprise_target_new_login_enable",
+    ),
     "nscript": (
         "nscript_enable",
         "nscript_cats",
@@ -2176,29 +2149,30 @@ class ConfigNotify:
     @secured_expose(check_configlock=True)
     def index(self, **kwargs):
         conf = build_header(sabnzbd.WEB_DIR_CONFIG)
-        conf["notify_types"] = sabnzbd.notifier.NOTIFICATION
+        conf["notify_types"] = sabnzbd.notifier.NOTIFICATION_TYPES
         conf["categories"] = list_cats(False)
         conf["have_ntfosd"] = sabnzbd.notifier.have_ntfosd()
-        conf["have_ncenter"] = sabnzbd.DARWIN and sabnzbd.FOUNDATION
+        conf["have_ncenter"] = sabnzbd.MACOS and sabnzbd.FOUNDATION
         conf["scripts"] = list_scripts(default=False, none=True)
 
         for section in NOTIFY_OPTIONS:
             for option in NOTIFY_OPTIONS[section]:
-                # Use get_string to make sure lists are displayed correctly
-                conf[option] = config.get_config(section, option).get_string()
+                conf[option] = config.get_config(section, option)()
 
-        template = Template(
+        # Use get_string to make sure lists are displayed correctly
+        conf["email_to"] = cfg.email_to.get_string()
+
+        return template_filtered_response(
             file=os.path.join(sabnzbd.WEB_DIR_CONFIG, "config_notify.tmpl"),
-            searchList=[conf],
-            compilerSettings=CHEETAH_DIRECTIVES,
+            search_list=conf,
         )
-        return template.respond()
 
     @secured_expose(check_api_key=True, check_configlock=True)
     def saveNotify(self, **kwargs):
         for section in NOTIFY_OPTIONS:
             for option in NOTIFY_OPTIONS[section]:
-                config.get_config(section, option).set(kwargs.get(option))
+                if msg := config.get_config(section, option).set(kwargs.get(option)):
+                    return badParameterResponse(msg, kwargs.get("ajax"))
         config.save_config()
         if kwargs.get("ajax"):
             return sabnzbd.api.report()

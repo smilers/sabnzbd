@@ -34,6 +34,9 @@
     <link rel="stylesheet" type="text/css" href="${root}staticcfg/bootstrap/css/bootstrap.min.css?v=$version" />
     <link rel="stylesheet" type="text/css" href="${root}staticcfg/css/chartist.min.css" />
     <link rel="stylesheet" type="text/css" href="${root}staticcfg/css/style.css?v=$version" />
+    <!--#if $color_scheme not in ('Light', '') #-->
+    <link rel="stylesheet" type="text/css" href="${root}staticcfg/css/${color_scheme}.css?v=$version"/>
+    <!--#end if#-->
 
     <link rel="shortcut icon" href="${root}staticcfg/ico/favicon.ico?v=$version" />
 
@@ -67,27 +70,7 @@
     <script type="text/javascript" src="${root}staticcfg/js/script.js?v=$version"></script>
     <script type="text/javascript">
         // Set default functions for the autocomplete everywhere
-        \$.extend(\$.fn.typeahead.defaults, {
-            source: function (query, process) {
-                // If there's no seperator, it must be a relative path
-                if(query.split(folderSeperator).length < 2 && this.\$element.data('initialdir')) {
-                    query  = this.\$element.data('initialdir') + folderSeperator + query;
-                }
-                // Get info from the API
-                return \$.get(folderBrowseUrl + '&compact=1&term=' + query, function (data) {
-                    return process(data);
-                });
-            },
-            updater: function(item) {
-                // Is it a relative path?
-                if(item.indexOf(this.\$element.data('initialdir')) === 0) {
-                    // Remove start
-                    return item.replace(this.\$element.data('initialdir')+folderSeperator, '');
-                }
-                // Full path
-                return item
-            }
-        })
+
 
         // to top right away
         if(window.location.hash) {
@@ -109,7 +92,7 @@
                 <span class="icon-bar"></span>
             </button>
 
-            <a class="navbar-logo navbar-logo-small" href="${root}" title="$T('Home')">
+            <a class="navbar-logo navbar-logo-small" href="${root}" title="$T('Home')" data-placement="bottom">
                 #include $webdir + "/staticcfg/images/logo-small.svg"#
             </a>
         </div>
@@ -181,7 +164,7 @@
                     </a>
                 </li>
                 <li>
-                    <a href="$helpuri$help_uri" target="_blank">
+                    <a href="$help_uri" target="_blank">
                         <span class="glyphicon glyphicon-question-sign"></span>
                         <strong>$T('menu-help')</strong>
                     </a>

@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -22,20 +22,32 @@ sabnzbd.newswrapper
 import errno
 import socket
 from threading import Thread
-from nntplib import NNTPPermanentError
 import time
 import logging
 import ssl
-from typing import List, Optional, Tuple, AnyStr
+import sabctools
+from typing import Optional, Tuple, Union
 
 import sabnzbd
 import sabnzbd.cfg
-from sabnzbd.constants import DEF_TIMEOUT
-from sabnzbd.encoding import utob
-from sabnzbd.misc import nntp_to_msg, is_ipv4_addr, is_ipv6_addr, get_server_addrinfo
+from sabnzbd.constants import DEF_NETWORKING_TIMEOUT, NNTP_BUFFER_SIZE, NTTP_MAX_BUFFER_SIZE
+from sabnzbd.encoding import utob, ubtou
+from sabnzbd.happyeyeballs import AddrInfo
+from sabnzbd.decorators import synchronized, DOWNLOADER_LOCK
+from sabnzbd.misc import int_conv
 
 # Set pre-defined socket timeout
-socket.setdefaulttimeout(DEF_TIMEOUT)
+socket.setdefaulttimeout(DEF_NETWORKING_TIMEOUT)
+
+
+class NNTPPermanentError(Exception):
+    def __init__(self, msg: str, code: int):
+        super().__init__()
+        self.msg = msg
+        self.code = code
+
+    def __str__(self) -> str:
+        return self.msg
 
 
 class NewsWrapper:
@@ -47,6 +59,8 @@ class NewsWrapper:
         "timeout",
         "article",
         "data",
+        "data_view",
+        "data_position",
         "nntp",
         "connected",
         "user_sent",
@@ -55,7 +69,6 @@ class NewsWrapper:
         "user_ok",
         "pass_ok",
         "force_login",
-        "status_code",
     )
 
     def __init__(self, server, thrdnum, block=False):
@@ -65,7 +78,10 @@ class NewsWrapper:
 
         self.timeout: Optional[float] = None
         self.article: Optional[sabnzbd.nzbstuff.Article] = None
-        self.data: List[AnyStr] = []
+
+        self.data: Optional[bytearray] = None
+        self.data_view: Optional[memoryview] = None
+        self.data_position: int = 0
 
         self.nntp: Optional[NNTP] = None
 
@@ -76,17 +92,27 @@ class NewsWrapper:
         self.pass_ok: bool = False
         self.force_login: bool = False
         self.group: Optional[str] = None
-        self.status_code: Optional[int] = None
+
+    @property
+    def status_code(self) -> Optional[int]:
+        if self.data_position >= 3:
+            return int_conv(self.data[:3])
+
+    @property
+    def nntp_msg(self) -> str:
+        return ubtou(self.data[: self.data_position]).strip()
 
     def init_connect(self):
         """Setup the connection in NNTP object"""
-        # Server-info is normally requested by initialization of
-        # servers in Downloader, but not when testing servers
-        if self.blocking and not self.server.info:
-            self.server.info = get_server_addrinfo(self.server.host, self.server.port)
+        # Sanity check, especially for the server test
+        if not self.server.addrinfo:
+            raise socket.error(errno.EADDRNOTAVAIL, T("Invalid server address."))
 
-        # Construct NNTP object
-        self.nntp = NNTP(self, self.server.hostip)
+        # Construct buffer and NNTP object
+        self.data = sabctools.bytearray_malloc(NNTP_BUFFER_SIZE)
+        self.data_view = memoryview(self.data)
+        self.reset_data_buffer()
+        self.nntp = NNTP(self, self.server.addrinfo)
         self.timeout = time.time() + self.server.timeout
 
     def finish_connect(self, code: int):
@@ -98,14 +124,6 @@ class NewsWrapper:
             self.pass_sent = True
             self.pass_ok = True
 
-        if code == 501 and self.user_sent:
-            # Change to a sensible text
-            code = 481
-            self.data[0] = "%d %s" % (code, T("Authentication failed, check username/password."))
-            self.status_code = code
-            self.user_ok = True
-            self.pass_sent = True
-
         if code == 480:
             self.force_login = True
             self.connected = False
@@ -114,12 +132,12 @@ class NewsWrapper:
             self.pass_sent = False
             self.pass_ok = False
 
-        if code in (400, 502):
-            raise NNTPPermanentError(nntp_to_msg(self.data))
+        if code in (400, 500, 502):
+            raise NNTPPermanentError(self.nntp_msg, code)
         elif not self.user_sent:
             command = utob("authinfo user %s\r\n" % self.server.username)
             self.nntp.sock.sendall(command)
-            self.clear_data()
+            self.reset_data_buffer()
             self.user_sent = True
         elif not self.user_ok:
             if code == 381:
@@ -134,12 +152,12 @@ class NewsWrapper:
         if self.user_ok and not self.pass_sent:
             command = utob("authinfo pass %s\r\n" % self.server.password)
             self.nntp.sock.sendall(command)
-            self.clear_data()
+            self.reset_data_buffer()
             self.pass_sent = True
         elif self.user_ok and not self.pass_ok:
             if code != 281:
                 # Assume that login failed (code 481 or other)
-                raise NNTPPermanentError(nntp_to_msg(self.data))
+                raise NNTPPermanentError(self.nntp_msg, code)
             else:
                 self.connected = True
 
@@ -158,82 +176,75 @@ class NewsWrapper:
         else:
             command = utob("ARTICLE <%s>\r\n" % self.article.article)
         self.nntp.sock.sendall(command)
-        self.clear_data()
+        self.reset_data_buffer()
 
-    def send_group(self, group: str):
-        """Send the NNTP GROUP command"""
+    def recv_chunk(self) -> Tuple[int, bool, bool]:
+        """Receive data, return #bytes, end-of-line, end-of-article"""
+        # Resize the buffer in the extremely unlikely case that it got full
+        if self.data_position == len(self.data):
+            self.nntp.nw.increase_data_buffer()
+
+        # Receive data into the pre-allocated buffer
+        if self.nntp.nw.server.ssl and not self.nntp.nw.blocking and sabctools.openssl_linked:
+            # Use patched version when downloading
+            bytes_recv = sabctools.unlocked_ssl_recv_into(self.nntp.sock, self.data_view[self.data_position :])
+        else:
+            bytes_recv = self.nntp.sock.recv_into(self.data_view[self.data_position :])
+
+        # No data received
+        if bytes_recv == 0:
+            raise ConnectionError("Server closed connection")
+
+        # Success, move timeout and internal data position
         self.timeout = time.time() + self.server.timeout
-        command = utob("GROUP %s\r\n" % group)
-        self.nntp.sock.sendall(command)
-        self.clear_data()
+        self.data_position += bytes_recv
 
-    def recv_chunk(self, block: bool = False) -> Tuple[int, bool, bool]:
-        """Receive data, return #bytes, done, skip"""
-        self.timeout = time.time() + self.server.timeout
-        while 1:
-            try:
-                if self.nntp.nw.server.ssl:
-                    # SSL chunks come in 16K frames
-                    # Setting higher limits results in slowdown
-                    chunk = self.nntp.sock.recv(16384)
-                else:
-                    # Get as many bytes as possible
-                    chunk = self.nntp.sock.recv(262144)
-                break
-            except ssl.SSLWantReadError:
-                # SSL connections will block until they are ready.
-                # Either ignore the connection until it responds
-                # Or wait in a loop until it responds
-                if block:
-                    # time.sleep(0.0001)
-                    continue
-                else:
-                    return 0, False, True
+        # The SSL-layer might still contain data even though the socket does not. Another Downloader-loop would
+        # not identify this socket anymore as it is not returned by select(). So, we have to forcefully trigger
+        # another recv_chunk so the buffer is increased and the data from the SSL-layer is read. See #2752.
+        if self.nntp.nw.server.ssl and self.data_position == len(self.data) and self.nntp.sock.pending() > 0:
+            # We do not perform error-handling, as we know there is data available to read
+            additional_bytes_recv, additional_end_of_line, additional_end_of_article = self.recv_chunk()
+            return bytes_recv + additional_bytes_recv, additional_end_of_line, additional_end_of_article
 
-        if not self.data:
-            try:
-                self.status_code = int(chunk[:3])
-            except:
-                self.status_code = None
-
-        # Append so we can do 1 join(), much faster than multiple!
-        self.data.append(chunk)
-
-        # Official end-of-article is ".\r\n" but sometimes it can get lost between 2 chunks
-        chunk_len = len(chunk)
-        if chunk[-5:] == b"\r\n.\r\n":
-            return chunk_len, True, False
-        elif chunk_len < 5 and len(self.data) > 1:
-            # We need to make sure the end is not split over 2 chunks
-            # This is faster than join()
-            combine_chunk = self.data[-2][-5:] + chunk
-            if combine_chunk[-5:] == b"\r\n.\r\n":
-                return chunk_len, True, False
+        # Check for end of line
+        # Using the data directly seems faster than the memoryview
+        if self.data[self.data_position - 2 : self.data_position] == b"\r\n":
+            # Official end-of-article is "\r\n.\r\n"
+            if self.data[self.data_position - 5 : self.data_position] == b"\r\n.\r\n":
+                return bytes_recv, True, True
+            return bytes_recv, True, False
 
         # Still in middle of data, so continue!
-        return chunk_len, False, False
+        return bytes_recv, False, False
 
     def soft_reset(self):
         """Reset for the next article"""
         self.timeout = None
         self.article = None
-        self.clear_data()
+        self.reset_data_buffer()
 
-    def clear_data(self):
-        """Clear the stored raw data"""
-        self.data = []
-        self.status_code = None
+    def reset_data_buffer(self):
+        """Reset the data position"""
+        self.data_position = 0
 
-    def hard_reset(self, wait: bool = True, send_quit: bool = True):
+    def increase_data_buffer(self):
+        """Resize the buffer in the extremely unlikely case that it overflows"""
+        # Sanity check before we go any further
+        if len(self.data) > NTTP_MAX_BUFFER_SIZE:
+            raise BufferError("Maximum data buffer size exceeded")
+
+        # Input needs to be integer, floats don't work
+        new_buffer = sabctools.bytearray_malloc(len(self.data) + NNTP_BUFFER_SIZE // 2)
+        new_buffer[: len(self.data)] = self.data
+        logging.info("Increased buffer from %d to %d for %s", len(self.data), len(new_buffer), str(self))
+        self.data = new_buffer
+        self.data_view = memoryview(self.data)
+
+    def hard_reset(self, wait: bool = True):
         """Destroy and restart"""
         if self.nntp:
-            try:
-                if send_quit:
-                    self.nntp.sock.sendall(b"QUIT\r\n")
-                    time.sleep(0.01)
-                self.nntp.sock.close()
-            except:
-                pass
+            self.nntp.close(send_quit=self.connected)
             self.nntp = None
 
         # Reset all variables (including the NNTP connection)
@@ -258,28 +269,53 @@ class NewsWrapper:
 
 class NNTP:
     # Pre-define attributes to save memory
-    __slots__ = ("nw", "host", "error_msg", "sock", "fileno")
+    __slots__ = ("nw", "addrinfo", "error_msg", "sock", "fileno", "closed")
 
-    def __init__(self, nw: NewsWrapper, host):
+    def __init__(self, nw: NewsWrapper, addrinfo: AddrInfo):
         self.nw: NewsWrapper = nw
-        self.host: str = host  # Store the fastest ip
+        # Add local reference to prevent crash in case the server.addrinfo is reset
+        self.addrinfo: AddrInfo = addrinfo
         self.error_msg: Optional[str] = None
 
-        if not self.nw.server.info:
-            raise socket.error(errno.EADDRNOTAVAIL, "Address not available - Check for internet or DNS problems")
-
-        af, socktype, proto, canonname, sa = self.nw.server.info[0]
-
-        # there will be a connect to host (or self.host, so let's force set 'af' to the correct value
-        if is_ipv4_addr(self.host):
-            af = socket.AF_INET
-        if is_ipv6_addr(self.host):
-            af = socket.AF_INET6
+        # Prevent closing this socket until it's done connecting
+        self.closed = False
 
         # Create SSL-context if it is needed and not created yet
         if self.nw.server.ssl and not self.nw.server.ssl_context:
             # Setup the SSL socket
-            self.nw.server.ssl_context = ssl.create_default_context()
+            # Set Certificate validation: 0=Disabled, 1=Minimal, 2=Medium, 3=Strict
+            self.nw.server.ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+
+            # Allow those pesky virus-scanners to inject their scanning certificates
+            if self.nw.server.ssl_verify <= 2:
+                self.nw.server.ssl_context.verify_flags &= ~ssl.VERIFY_X509_STRICT
+                # This flag is only available for Python 3.10 and above
+                if hasattr(ssl, "VERIFY_X509_PARTIAL_CHAIN"):
+                    self.nw.server.ssl_context.verify_flags &= ~ssl.VERIFY_X509_PARTIAL_CHAIN
+            else:
+                # Make sure it's enabled for Strict mode, also pre-3.13
+                self.nw.server.ssl_context.verify_flags |= ssl.VERIFY_X509_STRICT
+                # This flag is only available for Python 3.10 and above
+                if hasattr(ssl, "VERIFY_X509_PARTIAL_CHAIN"):
+                    self.nw.server.ssl_context.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+
+            # Only verify hostname when Medium or Strict
+            if self.nw.server.ssl_verify <= 1:
+                self.nw.server.ssl_context.check_hostname = False
+
+            # Certificates optional
+            if self.nw.server.ssl_verify <= 0:
+                self.nw.server.ssl_context.verify_mode = ssl.CERT_NONE
+
+            # Did the user set a custom cipher-string?
+            if self.nw.server.ssl_ciphers:
+                # At their own risk, socket will error out in case it was invalid
+                self.nw.server.ssl_context.set_ciphers(self.nw.server.ssl_ciphers)
+                # Python does not allow setting ciphers on TLSv1.3, so have to force TLSv1.2 as the maximum
+                self.nw.server.ssl_context.maximum_version = ssl.TLSVersion.TLSv1_2
+            else:
+                # Support at least TLSv1.2+ ciphers, as some essential ones are removed by default in Python 3.10
+                self.nw.server.ssl_context.set_ciphers("HIGH")
 
             if sabnzbd.cfg.allow_old_ssl_tls():
                 # Allow anything that the system has
@@ -288,25 +324,8 @@ class NNTP:
                 # We want a modern TLS (1.2 or higher), so we disallow older protocol versions (<= TLS 1.1)
                 self.nw.server.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
 
-            # Only verify hostname when we're strict
-            if self.nw.server.ssl_verify < 2:
-                self.nw.server.ssl_context.check_hostname = False
-                # Certificates optional
-                if self.nw.server.ssl_verify == 0:
-                    self.nw.server.ssl_context.verify_mode = ssl.CERT_NONE
-
-            # Did the user set a custom cipher-string?
-            if self.nw.server.ssl_ciphers:
-                # At their own risk, socket will error out in case it was invalid
-                self.nw.server.ssl_context.set_ciphers(self.nw.server.ssl_ciphers)
-
-            # Disable any verification if the setup is bad
-            if not sabnzbd.CERTIFICATE_VALIDATION:
-                self.nw.server.ssl_context.check_hostname = False
-                self.nw.server.ssl_context.verify_mode = ssl.CERT_NONE
-
         # Create socket and store fileno of the socket
-        self.sock = socket.socket(af, socktype, proto)
+        self.sock: Union[socket.socket, ssl.SSLSocket] = socket.socket(self.addrinfo.family, self.addrinfo.type)
         self.fileno: int = self.sock.fileno()
 
         # Open the connection in a separate thread due to avoid blocking
@@ -319,12 +338,11 @@ class NNTP:
     def connect(self):
         """Start of connection, can be performed a-sync"""
         try:
-            # Wait only 15 seconds during server test
-            if self.nw.blocking:
-                self.sock.settimeout(15)
+            # Wait the defined timeout during connect and SSL-setup
+            self.sock.settimeout(self.nw.server.timeout)
 
             # Connect
-            self.sock.connect((self.host, self.nw.server.port))
+            self.sock.connect(self.addrinfo.sockaddr)
 
             # Secured or unsecured?
             if self.nw.server.ssl:
@@ -339,13 +357,15 @@ class NNTP:
                 )
                 self.nw.server.ssl_info = "%s (%s)" % (self.sock.version(), self.sock.cipher()[0])
 
-            # Set blocking mode
-            self.sock.setblocking(self.nw.blocking)
-
-            # Now it's safe to add the socket to the list of active sockets
-            # Skip this step during server test
+            # Skip during server test
             if not self.nw.blocking:
-                sabnzbd.Downloader.add_socket(self.fileno, self.nw)
+                # Set to non-blocking mode
+                self.sock.setblocking(False)
+                # Only add to active sockets if it's not somehow already closing
+                # Locked, so it can't interleave with any of the Downloader "__nw" actions
+                with DOWNLOADER_LOCK:
+                    if not self.closed:
+                        sabnzbd.Downloader.add_socket(self.fileno, self.nw)
         except OSError as e:
             self.error(e)
 
@@ -365,7 +385,9 @@ class NNTP:
                     "Certificate hostname mismatch: the server hostname is not listed in the certificate. This is a server issue."
                 )
             elif "certificate verify failed" in raw_error_str:
-                raw_error_str = T("Certificate not valid. This is most probably a server issue.")
+                raw_error_str = T(
+                    "Certificate could not be validated. This could be a server issue or due to a locally injected certificate (for example by firewall or virus scanner). Try setting Certificate verification to Medium."
+                )
 
             # Reformat error and overwrite str-representation
             error_str = T("Server %s uses an untrusted certificate [%s]") % (self.nw.server.host, raw_error_str)
@@ -383,13 +405,37 @@ class NNTP:
         # Blocking = server-test, pass directly to display code
         if self.nw.blocking:
             raise socket.error(errno.ECONNREFUSED, str(error))
-        else:
-            msg = "Failed to connect: %s" % (str(error))
-            msg = "%s %s@%s:%s" % (msg, self.nw.thrdnum, self.host, self.nw.server.port)
+
+        # Ignore if the socket was already closed, resulting in errors
+        if not self.closed:
+            msg = T("Failed to connect: %s %s@%s:%s (%s)") % (
+                str(error),
+                self.nw.thrdnum,
+                self.nw.server.host,
+                self.nw.server.port,
+                self.addrinfo.canonname,
+            )
             self.error_msg = msg
             self.nw.server.next_busy_threads_check = 0
-            logging.info(msg)
+            if self.nw.server.warning == msg:
+                logging.info(msg)
+            else:
+                logging.warning(msg)
             self.nw.server.warning = msg
 
+    @synchronized(DOWNLOADER_LOCK)
+    def close(self, send_quit: bool):
+        """Safely close socket.
+        Locked to match connect(), even though most likely the caller already holds the same lock."""
+        # Set status first, so any calls in connect/error are handled correctly
+        self.closed = True
+        try:
+            if send_quit:
+                self.sock.sendall(b"QUIT\r\n")
+                time.sleep(0.01)
+            self.sock.close()
+        except Exception as e:
+            logging.info("%s@%s: Failed to close socket (error=%s)", self.nw.thrdnum, self.nw.server.host, str(e))
+
     def __repr__(self):
-        return "<NNTP: %s:%s>" % (self.host, self.nw.server.port)
+        return "<NNTP: %s:%s>" % (self.addrinfo.canonname, self.nw.server.port)

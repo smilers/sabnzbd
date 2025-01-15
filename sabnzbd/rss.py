@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -27,11 +27,20 @@ import threading
 import urllib.parse
 
 import sabnzbd
-from sabnzbd.constants import RSS_FILE_NAME, DEFAULT_PRIORITY, DUP_PRIORITY
+from sabnzbd.constants import RSS_FILE_NAME, DEFAULT_PRIORITY
 from sabnzbd.decorators import synchronized
 import sabnzbd.config as config
 import sabnzbd.cfg as cfg
-from sabnzbd.misc import cat_convert, convert_filter, cat_to_opts, match_str, from_units, int_conv, get_base_url
+from sabnzbd.misc import (
+    cat_convert,
+    convert_filter,
+    cat_to_opts,
+    match_str,
+    from_units,
+    int_conv,
+    get_base_url,
+    helpful_warning,
+)
 import sabnzbd.emailer as emailer
 
 import feedparser
@@ -65,8 +74,8 @@ def remove_obsolete(jobs, new_jobs):
 
 RSS_LOCK = threading.RLock()
 _RE_SP = re.compile(r"s*(\d+)[ex](\d+)", re.I)
-_RE_SIZE1 = re.compile(r"Size:\s*(\d+\.\d+\s*[KMG]{0,1})B\W*", re.I)
-_RE_SIZE2 = re.compile(r"\W*(\d+\.\d+\s*[KMG]{0,1})B\W*", re.I)
+_RE_SIZE1 = re.compile(r"Size:\s*(\d+\.\d+\s*[KMG]?)B\W*", re.I)
+_RE_SIZE2 = re.compile(r"\W*(\d+\.\d+\s*[KMG]?)B\W*", re.I)
 
 
 class RSSReader:
@@ -76,7 +85,7 @@ class RSSReader:
         self.shutdown = False
 
         try:
-            self.jobs = sabnzbd.load_admin(RSS_FILE_NAME)
+            self.jobs = sabnzbd.filesystem.load_admin(RSS_FILE_NAME)
             if self.jobs:
                 for feed in self.jobs:
                     remove_obsolete(self.jobs[feed], list(self.jobs[feed]))
@@ -219,7 +228,7 @@ class RSSReader:
 
                 if msg:
                     # We need to escape any "%20" that could be in the warning due to the URL's
-                    logging.warning_helpful(urllib.parse.unquote(msg))
+                    helpful_warning(urllib.parse.unquote(msg))
                 elif not entries:
                     msg = T("RSS Feed %s was empty") % uri
                     logging.info(msg)
@@ -299,7 +308,9 @@ class RSSReader:
                     myPrio = defPrio
                     n = 0
                     if ("F" in reTypes or "S" in reTypes) and (not season or not episode):
-                        season, episode = sabnzbd.newsunpack.analyse_show(title)[1:3]
+                        show_analysis = sabnzbd.sorting.BasicAnalyzer(title)
+                        season = show_analysis.info.get("season")
+                        episode = show_analysis.info.get("episode")
 
                     # Match against all filters until an positive or negative match
                     logging.debug("Size %s", size)
@@ -326,12 +337,7 @@ class RSSReader:
                                 logging.debug("Filter requirement match on rule %d", n)
                                 result = False
                                 break
-                            elif (
-                                reTypes[n] == "S"
-                                and season
-                                and episode
-                                and ep_match(season, episode, regexes[n], title)
-                            ):
+                            elif reTypes[n] == "S" and ep_match(season, episode, regexes[n], title):
                                 logging.debug("Filter matched on rule %d", n)
                                 result = True
                                 break
@@ -381,19 +387,6 @@ class RSSReader:
                         elif not ((rePrios[n] != str(DEFAULT_PRIORITY)) or category):
                             myPrio = catPrio
 
-                    if cfg.no_dupes() and self.check_duplicate(title):
-                        if cfg.no_dupes() == 1:
-                            # Dupe-detection: Discard
-                            logging.info("Ignoring duplicate job %s", title)
-                            continue
-                        elif cfg.no_dupes() == 3:
-                            # Dupe-detection: Fail
-                            # We accept it so the Queue can send it to the History
-                            logging.info("Found duplicate job %s", title)
-                        else:
-                            # Dupe-detection: Pause
-                            myPrio = DUP_PRIORITY
-
                     act = download and not first
                     if link in jobs:
                         act = act and not jobs[link].get("status", "").endswith("*")
@@ -403,6 +396,7 @@ class RSSReader:
                         star = first
                     if result:
                         _HandleLink(
+                            feed,
                             jobs,
                             link,
                             infourl,
@@ -425,6 +419,7 @@ class RSSReader:
                             new_downloads.append(title)
                     else:
                         _HandleLink(
+                            feed,
                             jobs,
                             link,
                             infourl,
@@ -491,7 +486,7 @@ class RSSReader:
 
     @synchronized(RSS_LOCK)
     def save(self):
-        sabnzbd.save_admin(self.jobs, RSS_FILE_NAME)
+        sabnzbd.filesystem.save_admin(self.jobs, RSS_FILE_NAME)
 
     @synchronized(RSS_LOCK)
     def delete(self, feed):
@@ -535,18 +530,6 @@ class RSSReader:
             for item in self.jobs[feed]:
                 if self.jobs[feed][item]["status"] == "D":
                     self.jobs[feed][item]["status"] = "D-"
-
-    def check_duplicate(self, title):
-        """Check if this title was in this or other feeds
-        Return matching feed name
-        """
-        title = title.lower()
-        for fd in self.jobs:
-            for lk in self.jobs[fd]:
-                item = self.jobs[fd][lk]
-                if item.get("status", " ")[0] == "D" and item.get("title", "").lower() == title:
-                    return fd
-        return ""
 
 
 def patch_feedparser():
@@ -595,6 +578,7 @@ def patch_feedparser():
 
 
 def _HandleLink(
+    feed,
     jobs,
     link,
     infourl,
@@ -643,8 +627,17 @@ def _HandleLink(
     if download:
         jobs[link]["status"] = "D"
         jobs[link]["time_downloaded"] = time.localtime()
+
         logging.info("Adding %s (%s) to queue", link, title)
-        sabnzbd.add_url(link, pp=pp, script=script, cat=cat, priority=priority, nzbname=nzbname)
+        sabnzbd.urlgrabber.add_url(
+            link,
+            pp=pp,
+            script=script,
+            cat=cat,
+            priority=priority,
+            nzbname=nzbname,
+            nzo_info={"RSS": feed},
+        )
     else:
         if star:
             jobs[link]["status"] = flag + "*"
@@ -672,7 +665,7 @@ def _get_link(entry):
 
     # GUID usually has URL to result on page
     infourl = None
-    if entry.get("id") and entry.id != link and entry.id.startswith("http"):
+    if entry.get("id") and entry.id != link and entry.id.lower().startswith("http"):
         infourl = entry.id
 
     if size == 0:
@@ -707,7 +700,7 @@ def _get_link(entry):
     except (KeyError, IndexError):
         season = episode = 0
 
-    if link and "http" in link.lower():
+    if link and link.lower().startswith("http"):
         try:
             category = entry.cattext
         except AttributeError:
@@ -737,8 +730,7 @@ def ep_match(season, episode, expr, title=None):
     """Return True if season, episode is at or above expected
     Optionally `title` can be matched
     """
-    m = _RE_SP.search(expr)
-    if m:
+    if m := _RE_SP.search(expr):
         # Make sure they are all integers for comparison
         req_season = int(m.group(1))
         req_episode = int(m.group(2))

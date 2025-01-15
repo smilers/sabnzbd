@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -25,16 +25,16 @@ import subprocess
 import time
 import threading
 import logging
-from typing import Optional
+from typing import Optional, Dict, List, Tuple
 
 import sabnzbd
 import sabnzbd.cfg as cfg
 from sabnzbd.misc import int_conv, format_time_string, build_and_run_command
-from sabnzbd.filesystem import long_path, remove_all, real_path, remove_file
+from sabnzbd.filesystem import long_path, remove_all, real_path, remove_file, get_basename
 from sabnzbd.nzbstuff import NzbObject, NzbFile
 from sabnzbd.encoding import platform_btou
 from sabnzbd.decorators import synchronized
-from sabnzbd.newsunpack import EXTRACTFROM_RE, EXTRACTED_RE, rar_volumelist
+from sabnzbd.newsunpack import RAR_EXTRACTFROM_RE, RAR_EXTRACTED_RE, rar_volumelist, add_time_left
 from sabnzbd.postproc import prepare_extraction_path
 from sabnzbd.utils.rarfile import RarFile
 from sabnzbd.utils.diskspeed import diskspeedmeasure
@@ -54,20 +54,20 @@ class DirectUnpacker(threading.Thread):
 
         self.nzo: NzbObject = nzo
         self.active_instance: Optional[subprocess.Popen] = None
-        self.killed = False
+        self.killed: bool = False
         self.next_file_lock = threading.Condition(threading.RLock())
 
         self.unpack_dir_info = None
         self.rarfile_nzf: Optional[NzbFile] = None
-        self.cur_setname = None
-        self.cur_volume = 0
-        self.total_volumes = {}
-        self.unpack_time = 0.0
+        self.cur_setname: Optional[str] = None
+        self.cur_volume: int = 0
+        self.total_volumes: Dict[str, int] = {}
+        self.unpack_time: float = 0.0
 
-        self.success_sets = {}
-        self.next_sets = []
+        self.success_sets: Dict[str, Tuple[List[str], List[str]]] = {}
+        self.next_sets: List[NzbFile] = []
 
-        self.duplicate_lines = 0
+        self.duplicate_lines: int = 0
 
         nzo.direct_unpacker = self
 
@@ -108,6 +108,7 @@ class DirectUnpacker(threading.Thread):
 
     def set_volumes_for_nzo(self):
         """Loop over all files to detect the names"""
+        logging.debug("Parsing setname and volume information for %s" % self.nzo.final_name)
         none_counter = 0
         found_counter = 0
         for nzf in self.nzo.files + self.nzo.finished_files:
@@ -179,23 +180,30 @@ class DirectUnpacker(threading.Thread):
             with START_STOP_LOCK:
                 if not self.active_instance or not self.active_instance.stdout:
                     break
-                char = self.active_instance.stdout.read(1)
 
+                while 1:
+                    # Keep reading until reaching space or end of line
+                    # to prevent continuous locking and unlocking
+                    char = self.active_instance.stdout.read(1)
+                    linebuf += char
+
+                    if char in (b" ", b"\n", b""):
+                        break
+
+            # End of program
             if not char:
-                # End of program
                 break
-            linebuf += char
-
-            # Continue if it's not a space or end of line
-            if char not in (b" ", b"\n"):
-                continue
 
             # Handle whole lines
             if char == b"\n":
                 # When reaching end-of-line, we can safely convert and add to the log
                 linebuf_encoded = platform_btou(linebuf.strip())
-                unrar_log.append(linebuf_encoded)
                 linebuf = b""
+
+                # Skip empty lines
+                if not linebuf_encoded:
+                    continue
+                unrar_log.append(linebuf_encoded)
 
                 # Error? Let PP-handle this job
                 if any(
@@ -206,7 +214,7 @@ class DirectUnpacker(threading.Thread):
                         "in the encrypted file",
                         "CRC failed",
                         "checksum failed",
-                        "You need to start extraction from a previous volume",
+                        "not enough space on the disk",
                         "password is incorrect",
                         "Incorrect password",
                         "Write error",
@@ -244,17 +252,25 @@ class DirectUnpacker(threading.Thread):
                     self.nzo.set_unpack_info("Unpack", msg, self.cur_setname)
 
                     # Write current log and clear
-                    logging.debug("DirectUnpack Unrar output %s", "\n".join(unrar_log))
+                    logging.debug("DirectUnpack Unrar output: \n%s", "\n".join(unrar_log))
                     unrar_log = []
                     rarfiles = []
                     extracted = []
 
                     # Are there more files left?
-                    while self.nzo.files and not self.next_sets:
+                    while not self.nzo.removed_from_queue and not self.next_sets:
+                        logging.debug("Direct Unpack for %s waiting for more sets", self.nzo.final_name)
                         with self.next_file_lock:
                             self.next_file_lock.wait()
 
                     # Is there another set to do?
+                    logging.debug(
+                        "Direct Unpack for %s continuing: killed=%s, cur_setname=%s, next_sets=%s",
+                        self.nzo.final_name,
+                        self.killed,
+                        self.cur_setname,
+                        self.next_sets,
+                    )
                     if self.next_sets:
                         # Start new instance
                         nzf = self.next_sets.pop(0)
@@ -270,18 +286,16 @@ class DirectUnpacker(threading.Thread):
 
                 elif linebuf_encoded.startswith("Extracting from"):
                     # List files we used
-                    filename = re.search(EXTRACTFROM_RE, linebuf_encoded).group(1)
+                    filename = re.search(RAR_EXTRACTFROM_RE, linebuf_encoded).group(1)
                     if filename not in rarfiles:
                         rarfiles.append(filename)
-                else:
+                elif m := re.search(RAR_EXTRACTED_RE, linebuf_encoded):
                     # List files we extracted
-                    m = re.search(EXTRACTED_RE, linebuf_encoded)
-                    if m:
-                        # In case of flat-unpack, UnRar still prints the whole path (?!)
-                        unpacked_file = m.group(2)
-                        if cfg.flat_unpack():
-                            unpacked_file = os.path.basename(unpacked_file)
-                        extracted.append(real_path(self.unpack_dir_info[0], unpacked_file))
+                    # In case of flat-unpack, UnRar still prints the whole path (?!)
+                    unpacked_file = m.group(2)
+                    if cfg.flat_unpack():
+                        unpacked_file = os.path.basename(unpacked_file)
+                    extracted.append(real_path(self.unpack_dir_info[0], unpacked_file))
 
             if linebuf.endswith(b"[C]ontinue, [Q]uit "):
                 # Stop timer
@@ -292,9 +306,13 @@ class DirectUnpacker(threading.Thread):
 
                 # Possible that the instance was deleted while locked
                 if not self.killed:
+                    # Sometimes the assembler is still working on the file, resulting in "Unexpected end of archive".
+                    # So we delay a tiny bit before we continue. This is not the cleanest solution, but it works.
+                    time.sleep(0.1)
+
                     # If unrar stopped or is killed somehow, writing will cause a crash
                     try:
-                        # Give unrar some time to do it's thing
+                        # Give unrar some time to do its thing
                         self.active_instance.stdin.write(b"C\n")
                         start_time = time.time()
                         time.sleep(0.1)
@@ -306,7 +324,7 @@ class DirectUnpacker(threading.Thread):
                     if not last_volume_linebuf or last_volume_linebuf != linebuf:
                         # Next volume
                         self.cur_volume += 1
-                        self.nzo.set_action_line(T("Direct Unpack"), self.get_formatted_stats())
+                        self.nzo.set_action_line(T("Direct Unpack"), self.get_formatted_stats(include_time_left=True))
                         logging.info("DirectUnpacked volume %s for %s", self.cur_volume, self.cur_setname)
 
                     # If lines did not change and we don't have the next volume, this download is missing files!
@@ -325,12 +343,14 @@ class DirectUnpacker(threading.Thread):
         # Add last line and write any new output
         if linebuf:
             unrar_log.append(platform_btou(linebuf.strip()))
-            logging.debug("DirectUnpack Unrar output %s", "\n".join(unrar_log))
+        if unrar_log:
+            logging.debug("DirectUnpack Unrar output: \n%s", "\n".join(unrar_log))
 
         # Make more space
         self.reset_active()
         if self in ACTIVE_UNPACKERS:
             ACTIVE_UNPACKERS.remove(self)
+        logging.debug("Closing DirectUnpack for %s", self.nzo.final_name)
 
         # Set the thread to killed so it never gets restarted by accident
         self.killed = True
@@ -338,18 +358,22 @@ class DirectUnpacker(threading.Thread):
     def have_next_volume(self):
         """Check if next volume of set is available, start
         from the end of the list where latest completed files are
-        Make sure that files are 100% written to disk by checking md5sum
+        Make sure that files are 100% written to disk by checking nzf.assembled
         """
         for nzf_search in reversed(self.nzo.finished_files):
-            if nzf_search.setname == self.cur_setname and nzf_search.vol == (self.cur_volume + 1) and nzf_search.md5sum:
+            if (
+                nzf_search.setname == self.cur_setname
+                and nzf_search.vol == (self.cur_volume + 1)
+                and nzf_search.assembled
+            ):
                 return nzf_search
         return False
 
     def wait_for_next_volume(self):
-        """Wait for the correct volume to appear
-        But stop if it was killed or the NZB is done
+        """Wait for the correct volume to appear but stop if it was killed
+        or the NZB is in post-processing and no new files will be downloaded.
         """
-        while not self.have_next_volume() and not self.killed and self.nzo.files:
+        while not self.have_next_volume() and not self.killed and not self.nzo.pp_active:
             with self.next_file_lock:
                 self.next_file_lock.wait()
 
@@ -384,19 +408,19 @@ class DirectUnpacker(threading.Thread):
         # The first NZF
         self.rarfile_nzf = self.have_next_volume()
 
-        # Ignore if maybe this set is not there any more
+        # Ignore if maybe this set is not there anymore
         # This can happen due to race/timing issues when creating the sets
         if not self.rarfile_nzf:
             return
 
         # Generate command
         rarfile_path = os.path.join(self.nzo.download_path, self.rarfile_nzf.filename)
-        if sabnzbd.WIN32:
-            # For Unrar to support long-path, we need to circumvent Python's list2cmdline
+        if sabnzbd.WINDOWS:
+            # On Windows, UnRar uses a custom argument parser
             # See: https://github.com/sabnzbd/sabnzbd/issues/1043
             # The -scf forces the output to be UTF8
             command = [
-                "%s" % sabnzbd.newsunpack.RAR_COMMAND,
+                sabnzbd.newsunpack.RAR_COMMAND,
                 action,
                 "-vp",
                 "-idp",
@@ -408,17 +432,17 @@ class DirectUnpacker(threading.Thread):
                 "%s\\" % long_path(extraction_path),
             ]
         else:
-            # Don't use "-ai" (not needed for non-Windows)
             # The -scf forces the output to be UTF8
             command = [
-                "%s" % sabnzbd.newsunpack.RAR_COMMAND,
+                sabnzbd.newsunpack.RAR_COMMAND,
                 action,
                 "-vp",
                 "-idp",
                 "-scf",
                 "-o+",
+                "-ai",
                 password_command,
-                "%s" % rarfile_path,
+                rarfile_path,
                 "%s/" % extraction_path,
             ]
 
@@ -429,7 +453,9 @@ class DirectUnpacker(threading.Thread):
         self.cur_volume = 1
 
         # Need to disable buffer to have direct feedback
-        self.active_instance = build_and_run_command(command, flatten_command=True, bufsize=0)
+        self.active_instance = build_and_run_command(
+            command, windows_unrar_command=True, text_mode=False, stdin=subprocess.PIPE
+        )
 
         # Add to runners
         ACTIVE_UNPACKERS.append(self)
@@ -500,21 +526,25 @@ class DirectUnpacker(threading.Thread):
             # Reset settings
             self.reset_active()
 
-    def get_formatted_stats(self):
+    def get_formatted_stats(self, include_time_left: bool = False) -> str:
         """Get percentage or number of rar's done"""
         if self.cur_setname and self.cur_setname in self.total_volumes:
             # This won't work on obfuscated posts
             if self.total_volumes[self.cur_setname] >= self.cur_volume and self.cur_volume:
-                return "%02d/%02d" % (self.cur_volume, self.total_volumes[self.cur_setname])
-        return self.cur_volume
+                formatted_stats = "%02d/%02d" % (self.cur_volume, self.total_volumes[self.cur_setname])
+                if include_time_left:
+                    formatted_stats += add_time_left(
+                        (self.cur_volume / self.total_volumes[self.cur_setname]) * 100, time_used=self.unpack_time
+                    )
+                return formatted_stats
+        return str(self.cur_volume)
 
 
 def analyze_rar_filename(filename):
     """Extract volume number and setname from rar-filenames
     Both ".part01.rar" and ".r01"
     """
-    m = RAR_NR.search(filename)
-    if m:
+    if m := RAR_NR.search(filename):
         if m.group(4):
             # Special since starts with ".rar", ".r00"
             return m.group(1), int_conv(m.group(4)) + 2
@@ -522,7 +552,7 @@ def analyze_rar_filename(filename):
     else:
         # Detect if first of "rxx" set
         if filename.endswith(".rar"):
-            return os.path.splitext(filename)[0], 1
+            return get_basename(filename), 1
     return None, None
 
 
@@ -535,9 +565,9 @@ def abort_all():
 
 def test_disk_performance():
     """Test the incomplete-dir performance and enable
-    Direct Unpack if good enough (> 40MB/s)
+    Direct Unpack if good enough (> 100MB/s)
     """
-    if diskspeedmeasure(sabnzbd.cfg.download_dir.get_path()) > 40:
+    if diskspeedmeasure(sabnzbd.cfg.download_dir.get_path()) > 100:
         cfg.direct_unpack.set(True)
         logging.warning(
             T("Direct Unpack was automatically enabled.")

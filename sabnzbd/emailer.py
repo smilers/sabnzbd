@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -98,16 +98,14 @@ def send_email(message, email_to, test=None):
                 return errormsg(T("Failed to connect to mail server"))
 
         # TLS support
-        if mailconn.ehlo_resp:
-            m = re.search(b"STARTTLS", mailconn.ehlo_resp, re.IGNORECASE)
-            if m:
-                logging.debug("TLS mail server detected")
-                try:
-                    mailconn.starttls()
-                    mailconn.ehlo()
-                except:
-                    logging.info("Traceback: ", exc_info=True)
-                    return errormsg(T("Failed to initiate TLS connection"))
+        if mailconn.ehlo_resp and re.search(b"STARTTLS", mailconn.ehlo_resp, re.IGNORECASE):
+            logging.debug("TLS mail server detected")
+            try:
+                mailconn.starttls()
+                mailconn.ehlo()
+            except:
+                logging.info("Traceback: ", exc_info=True)
+                return errormsg(T("Failed to initiate TLS connection"))
 
         # Authentication
         if (email_account != "") and (email_pwd != ""):
@@ -236,7 +234,7 @@ def endjob(
     parm["script_ret"] = script_ret
     parm["cat"] = cat
     parm["size"] = "%sB" % to_units(bytes_downloaded)
-    parm["end_time"] = time.strftime(time_format("%Y-%m-%d %H:%M:%S"), time.localtime(time.time()))
+    parm["end_time"] = time.strftime(time_format("%Y-%m-%d %H:%M:%S"))
 
     return send_with_template("email", parm, test)
 
@@ -288,14 +286,12 @@ def _prepare_message(txt):
             body = True
         if body:
             payload.append(line)
-        else:
-            # See if we match a header
-            m = RE_HEADER.search(line)
-            if m:
-                header = True
-                keyword = m.group(1).strip()
-                value = m.group(2).strip()
-                msg[keyword] = value
+        elif m := RE_HEADER.search(line):
+            # If we match a header
+            header = True
+            keyword = m.group(1).strip()
+            value = m.group(2).strip()
+            msg[keyword] = value
 
     msg.set_content("\n".join(payload))
     return msg.as_bytes(policy=msg.policy.clone(linesep="\r\n"))

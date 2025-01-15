@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -108,6 +108,7 @@ class BPSMeter:
         "timeline_total",
         "article_stats_tried",
         "article_stats_failed",
+        "delayed_assembler",
         "day_label",
         "end_of_day",
         "end_of_week",
@@ -145,6 +146,8 @@ class BPSMeter:
         self.article_stats_tried: Dict[str, Dict[str, int]] = {}
         self.article_stats_failed: Dict[str, Dict[str, int]] = {}
 
+        self.delayed_assembler: int = 0
+
         self.day_label: str = time.strftime("%Y-%m-%d")
         self.end_of_day: float = tomorrow(t)  # Time that current day will end
         self.end_of_week: float = next_week(t)  # Time that current day will end
@@ -161,7 +164,7 @@ class BPSMeter:
 
     def save(self):
         """Save admin to disk"""
-        sabnzbd.save_admin(
+        sabnzbd.filesystem.save_admin(
             (
                 self.last_update,
                 self.grand_total,
@@ -203,7 +206,7 @@ class BPSMeter:
         res = False
         quota = self.left = cfg.quota_size.get_float()  # Quota for this period
         self.have_quota = bool(cfg.quota_size())
-        data = sabnzbd.load_admin(BYTES_FILE_NAME)
+        data = sabnzbd.filesystem.load_admin(BYTES_FILE_NAME)
         try:
             (
                 self.last_update,
@@ -281,6 +284,9 @@ class BPSMeter:
             self.day_label = time.strftime("%Y-%m-%d")
             self.end_of_day = tomorrow(t) - 1.0
             self.day_total = {}
+
+            # Reset delayed counters so they don't go too high
+            self.delayed_assembler = 0
 
             # Check end of week and end of month
             if t > self.end_of_week:
@@ -382,10 +388,10 @@ class BPSMeter:
     def get_sums(self):
         """return tuple of grand, month, week, day totals"""
         return (
-            sum([v for v in self.grand_total.values()]),
-            sum([v for v in self.month_total.values()]),
-            sum([v for v in self.week_total.values()]),
-            sum([v for v in self.day_total.values()]),
+            sum(self.grand_total.values()),
+            sum(self.month_total.values()),
+            sum(self.week_total.values()),
+            sum(self.day_total.values()),
         )
 
     def amounts(self, server: str):
@@ -424,40 +430,6 @@ class BPSMeter:
         self.add_empty_time()
         # We record every second, but display at the user's refresh-rate
         return self.bps_list[::refresh_rate]
-
-    def get_stable_speed(self, timespan: int = 10) -> Optional[int]:
-        """See if there is a stable speed the last <timespan> seconds
-        None: indicates it can't determine yet
-        0: the speed was not stable during <timespan>
-        Positive float: the speed was stable
-        """
-        if len(self.bps_list) < timespan:
-            return None
-
-        # Check if speed fell by more than 15%
-        try:
-            if self.bps_list[-1] / self.bps_list[-timespan] < 0.85:
-                return 0
-        except:
-            pass
-
-        # Calculate the variance in the speed
-        avg = sum(self.bps_list[-timespan:]) / timespan
-        vari = 0
-        for bps in self.bps_list[-timespan:]:
-            vari += abs(bps - avg)
-        vari = vari / timespan
-
-        try:
-            # See if the variance is less than 5%
-            if (vari / (self.bps / KIBI)) < 0.05:
-                return avg
-            else:
-                return 0
-        except:
-            # Probably one of the values was 0
-            pass
-        return None
 
     def reset_quota(self, force: bool = False):
         """Check if it's time to reset the quota, optionally resuming
@@ -544,11 +516,9 @@ class BPSMeter:
             # Pattern = <day#> <hh:mm>
             # The <day> and <hh:mm> part can both be optional
             txt = cfg.quota_day().lower()
-            m = RE_DAY.search(txt)
-            if m:
+            if m := RE_DAY.search(txt):
                 self.q_day = int(m.group(1))
-            m = RE_HHMM.search(txt)
-            if m:
+            if m := RE_HHMM.search(txt):
                 self.q_hour = int(m.group(1))
                 self.q_minute = int(m.group(2))
             if self.q_period == "w":

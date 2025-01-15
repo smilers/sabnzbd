@@ -3,38 +3,62 @@ name: CI Tests
 on: [push, pull_request]
 
 jobs:
+  black:
+    name: Black Code Formatter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Black Code Formatter
+        uses: lgeiger/black-action@master
+        with:
+          args: >
+            SABnzbd.py
+            sabnzbd
+            scripts
+            tools
+            builder
+            builder/SABnzbd.spec
+            tests
+            --line-length=120
+            --target-version=py38
+            --check
+            --diff
+
   test:
     name: Test ${{ matrix.name }} - Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.7", "3.8", "3.9", "3.10"]
-        os: [ubuntu-20.04]
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        name: ["Linux"]
+        os: [ubuntu-latest]
         include:
           - name: macOS
             os: macos-latest
-            python-version: "3.10"
+            python-version: "3.13"
           - name: Windows
             os: windows-latest
-            python-version: "3.10"
+            python-version: "3.13"
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
+        architecture: "x64"
+        cache: pip
+        cache-dependency-path: "**/requirements.txt"
     - name: Install system dependencies
       if: runner.os == 'Linux'
-      run: sudo apt-get install unrar p7zip-full par2
+      run: sudo apt-get install unrar 7zip par2
     - name: Install Python dependencies
       run: |
         python --version
-        pip install --upgrade pip wheel
-        pip install --upgrade -r requirements.txt
+        python -m pip install --upgrade pip wheel
+        pip install --upgrade -r requirements.txt --no-dependencies
         pip install --upgrade -r tests/requirements.txt
     - name: Test SABnzbd
       run: pytest -s
-
-

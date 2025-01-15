@@ -94,7 +94,8 @@ legend,
 .nav-tabs>li.active>a,
 .nav-tabs>li.active>a:focus,
 .nav-tabs>li.active>a:hover,
-.nav-tabs>li>a:hover {
+.nav-tabs>li>a:hover,
+.nav-tabs>li>a:focus {
     background-color: #ddd;
     color: #555 !important;
     box-shadow: 0px -1px 1px 1px rgba(0,0,0,0.15);
@@ -137,6 +138,12 @@ select.form-control,
 #modal-options .options-function-box .input-group-addon {
     background-color: #555555;
     color: #EBEBEB;
+}
+
+.btn-default:not(.navbar-btn):hover,
+select:hover,
+input:hover {
+    background-color: #666666;
 }
 
 /* Needed to force the text-color */
@@ -199,7 +206,8 @@ tbody .caret {
 .info-container,
 #modal-options .options-status-box small,
 #modal-options #options-status small,
-#modal-options .tab-content h4 {
+#modal-options .tab-content h4,
+h2 small {
     color: #D6D6D6;
 }
 
@@ -265,16 +273,11 @@ button:focus {
     outline: initial;
 }
 
-/* Placeholders - Will not work if grouped! */
-::-webkit-input-placeholder {
-   color: #EBEBEB !important;
+.archive-icon {
+    fill: #EBEBEB;
 }
 
-::-moz-placeholder {
-   color: #EBEBEB !important;
-   opacity: 1 !important;
-}
-
-:-ms-input-placeholder {
-   color: #EBEBEB !important;
+::placeholder {
+    color: #EBEBEB !important;
+    opacity: 0.5 !important;
 }

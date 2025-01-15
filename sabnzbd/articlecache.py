@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -22,11 +22,11 @@ sabnzbd.articlecache - Article cache handling
 import logging
 import threading
 import struct
-from typing import Dict, List
+from typing import Dict, Collection
 
 import sabnzbd
 from sabnzbd.decorators import synchronized
-from sabnzbd.constants import GIGI, ANFO, MEBI, LIMIT_DECODE_QUEUE, MIN_DECODE_QUEUE
+from sabnzbd.constants import GIGI, ANFO, ASSEMBLER_WRITE_THRESHOLD
 from sabnzbd.nzbstuff import Article
 
 # Operations on the article table are handled via try/except.
@@ -41,14 +41,12 @@ class ArticleCache:
         self.__cache_size = 0
         self.__article_table: Dict[Article, bytes] = {}  # Dict of buffered articles
 
-        # Limit for the decoder is based on the total available cache
-        # so it can be larger on memory-rich systems
-        self.decoder_cache_article_limit = 0
+        self.assembler_write_trigger: int = 1
 
         # On 32 bit we only allow the user to set 1GB
         # For 64 bit we allow up to 4GB, in case somebody wants that
         self.__cache_upper_limit = GIGI
-        if sabnzbd.DARWIN or sabnzbd.WIN64 or (struct.calcsize("P") * 8) == 64:
+        if sabnzbd.MACOS or sabnzbd.WINDOWS or (struct.calcsize("P") * 8) == 64:
             self.__cache_upper_limit = 4 * GIGI
 
     def cache_info(self):
@@ -62,11 +60,14 @@ class ArticleCache:
         else:
             self.__cache_limit = min(limit, self.__cache_upper_limit)
 
-        # The decoder-limit should not be larger than 1/3th of the whole cache
-        # Calculated in number of articles, assuming 1 article = 1MB max
-        decoder_cache_limit = int(min(self.__cache_limit / 3 / MEBI, LIMIT_DECODE_QUEUE))
-        # The cache should also not be too small
-        self.decoder_cache_article_limit = max(decoder_cache_limit, MIN_DECODE_QUEUE)
+        # Set assembler_write_trigger to be the equivalent of ASSEMBLER_WRITE_THRESHOLD %
+        # of the total cache, assuming an article size of 750 000 bytes
+        self.assembler_write_trigger = int(self.__cache_limit * ASSEMBLER_WRITE_THRESHOLD / 100 / 750_000) + 1
+
+        logging.debug(
+            "Assembler trigger = %d",
+            self.assembler_write_trigger,
+        )
 
     @synchronized(ARTICLE_COUNTER_LOCK)
     def reserve_space(self, data_size: int):
@@ -85,17 +86,17 @@ class ArticleCache:
     def save_article(self, article: Article, data: bytes):
         """Save article in cache, either memory or disk"""
         nzo = article.nzf.nzo
-        if nzo.is_gone():
-            # Do not discard this article because the
-            # file might still be processed at this moment!!
+        # Skip if already post-processing or fully finished
+        if nzo.pp_or_finished:
             return
 
         # Register article for bookkeeping in case the job is deleted
-        nzo.add_saved_article(article)
+        nzo.saved_articles.add(article)
 
-        if article.lowest_partnum and not article.nzf.import_finished:
-            # Write the first-fetched articles to disk
-            # Otherwise the cache could overflow
+        if article.lowest_partnum and not (article.nzf.import_finished or article.nzf.filename_checked):
+            # Write the first-fetched articles to temporary file unless downloading
+            # of the rest of the parts has started or filename is verified.
+            # Otherwise the cache could overflow.
             self.__flush_article_to_disk(article, data)
             return
 
@@ -129,8 +130,10 @@ class ArticleCache:
                 logging.debug("Failed to load %s from cache, probably already deleted", article)
                 return data
         elif article.art_id:
-            data = sabnzbd.load_data(article.art_id, nzo.admin_path, remove=True, do_pickle=False, silent=True)
-        nzo.remove_saved_article(article)
+            data = sabnzbd.filesystem.load_data(
+                article.art_id, nzo.admin_path, remove=True, do_pickle=False, silent=True
+            )
+        nzo.saved_articles.discard(article)
         return data
 
     def flush_articles(self):
@@ -144,7 +147,7 @@ class ArticleCache:
                 # Could fail if already deleted by purge_articles or load_data
                 logging.debug("Failed to flush item from cache, probably already deleted or written to disk")
 
-    def purge_articles(self, articles: List[Article]):
+    def purge_articles(self, articles: Collection[Article]):
         """Remove all saved articles, from memory and disk"""
         logging.debug("Purging %s articles from the cache/disk", len(articles))
         for article in articles:
@@ -156,15 +159,12 @@ class ArticleCache:
                     # Could fail if already deleted by flush_articles or load_data
                     logging.debug("Failed to flush %s from cache, probably already deleted or written to disk", article)
             elif article.art_id:
-                sabnzbd.remove_data(article.art_id, article.nzf.nzo.admin_path)
+                sabnzbd.filesystem.remove_data(article.art_id, article.nzf.nzo.admin_path)
 
     @staticmethod
     def __flush_article_to_disk(article: Article, data):
-        nzo = article.nzf.nzo
-        if nzo.is_gone():
-            # Don't store deleted jobs
-            return
-
         # Save data, but don't complain when destination folder is missing
         # because this flush may come after completion of the NZO.
-        sabnzbd.save_data(data, article.get_art_id(), nzo.admin_path, do_pickle=False, silent=True)
+        sabnzbd.filesystem.save_data(
+            data, article.get_art_id(), article.nzf.nzo.admin_path, do_pickle=False, silent=True
+        )

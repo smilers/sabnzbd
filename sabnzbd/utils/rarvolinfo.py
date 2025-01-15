@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2009-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -31,7 +31,7 @@ except ImportError:
 
 def get_rar_extension(myrarfile):
     """
-    Find out orginal extension of a rar file. Returns "" in case of file problems
+    Find out original extension of a rar file. Returns "" in case of file problems
     So ... returns:     "part001.rar", ... "part005.rar"
     or old number scheme (can only happen for rar3/rar4 files): "rar", r00, ... r89
     """

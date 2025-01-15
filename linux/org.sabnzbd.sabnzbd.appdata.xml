@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2022-2024 by The SABnzbd-Team (sabnzbd.org) -->
+<component type="desktop-application">
+  <id>org.sabnzbd.sabnzbd</id>
+  <metadata_license>MIT</metadata_license>
+  <name>SABnzbd</name>
+  <summary>Free and easy binary newsreader</summary>
+  <description>
+    <p>
+      SABnzbd is a free and Open Source web-based binary newsreader,
+      with support for the popular nzb file format. It greatly simplifies
+      the process of downloading from Usenet, thanks to a friendly
+      web-based user interface and advanced built-in post-processing
+      options including the ability to automatically verify, repair,
+      extract and clean up downloaded posts. It runs anywhere, comes in
+      over a dozen languages, and integrates with a host of tools, apps
+      and services that help automate the download process.
+    </p>
+  </description>
+  <categories>
+    <category>Network</category>
+    <category>FileTransfer</category>
+  </categories>
+  <url type="homepage">https://sabnzbd.org</url>
+  <url type="bugtracker">https://github.com/sabnzbd/sabnzbd/issues</url>
+  <url type="vcs-browser">https://github.com/sabnzbd/sabnzbd</url>
+  <url type="translate">https://sabnzbd.org/wiki/translate</url>
+  <url type="donation">https://sabnzbd.org/donate</url>
+  <url type="help">https://sabnzbd.org/wiki/</url>
+  <url type="faq">https://sabnzbd.org/wiki/faq</url>
+  <url type="contact">https://sabnzbd.org/live-chat.html</url>
+  <releases>
+    <release version="4.5.0" date="2025-03-01" type="stable"/>
+    <release version="4.4.1" date="2024-12-23" type="stable"/>
+    <release version="4.4.0" date="2024-12-09" type="stable"/>
+    <release version="4.3.3" date="2024-08-01" type="stable"/>
+    <release version="4.3.2" date="2024-05-30" type="stable"/>
+    <release version="4.3.1" date="2024-05-03" type="stable"/>
+    <release version="4.3.0" date="2024-05-01" type="stable"/>
+    <release version="4.2.2" date="2024-02-01" type="stable"/>
+    <release version="4.2.1" date="2024-01-05" type="stable"/>
+    <release version="4.2.0" date="2024-01-03" type="stable"/>
+    <release version="4.1.0" date="2023-09-26" type="stable"/>
+    <release version="4.0.3" date="2023-06-16" type="stable"/>
+    <release version="4.0.2" date="2023-06-09" type="stable"/>
+    <release version="4.0.1" date="2023-05-01" type="stable"/>
+    <release version="4.0.0" date="2023-04-28" type="stable"/>
+    <release version="3.7.2" date="2023-02-05" type="stable"/>
+  </releases>
+  <launchable type="desktop-id">sabnzbd.desktop</launchable>
+  <provides>
+    <mediatype>application/x-nzb</mediatype>
+    <mediatype>application/x-compressed-nzb</mediatype>
+  </provides>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+  <recommends>
+    <display_length compare="ge">640</display_length>
+    <internet>always</internet>
+  </recommends>
+  <project_license>GPL-2.0-or-later</project_license>
+  <developer id="org.sabnzbd">
+    <name>The SABnzbd-Team</name>
+  </developer>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://sabnzbd.org/images/landing/screenshots/interface.png</image>
+      <caption>Web interface</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://sabnzbd.org/images/landing/screenshots/night-mode.png</image>
+      <caption>Night mode</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://sabnzbd.org/images/landing/screenshots/config.png</image>
+      <caption>Easy configuration</caption>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"/>
+</component>

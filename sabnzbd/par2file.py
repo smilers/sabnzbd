@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -23,10 +23,13 @@ import logging
 import os
 import re
 import struct
-from typing import Dict, Optional, Tuple, BinaryIO
+import sabctools
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 from sabnzbd.constants import MEBI
 from sabnzbd.encoding import correct_unknown_encoding
+from sabnzbd.filesystem import get_basename, get_ext
 
 PROBABLY_PAR2_RE = re.compile(r"(.*)\.vol(\d*)[+\-](\d*)\.par2", re.I)
 SCAN_LIMIT = 10 * MEBI
@@ -34,22 +37,37 @@ PAR_PKT_ID = b"PAR2\x00PKT"
 PAR_MAIN_ID = b"PAR 2.0\x00Main\x00\x00\x00\x00"
 PAR_FILE_ID = b"PAR 2.0\x00FileDesc"
 PAR_CREATOR_ID = b"PAR 2.0\x00Creator\x00"
+PAR_SLICE_ID = b"PAR 2.0\x00IFSC\x00\x00\x00\x00"
 PAR_RECOVERY_ID = b"RecvSlic"
 
 
-def is_parfile(filename: str) -> bool:
-    """Check quickly whether file has par2 signature
-    or if the filename has '.par2' in it
-    """
-    if os.path.exists(filename):
+@dataclass
+class FilePar2Info:
+    """Class for keeping track of par2 information of a file"""
+
+    filename: str
+    hash16k: bytes
+    filesize: int
+    filehash: Optional[int] = None
+    has_duplicate: bool = False
+
+
+def has_par2_in_filename(filename: str) -> bool:
+    """Check quickly whether filename has '.par2' in it"""
+    if ".par2" in filename.lower():
+        return True
+    return False
+
+
+def is_par2_file(filepath: str) -> bool:
+    """Check whether file has par2 signature"""
+    if os.path.exists(filepath):
         try:
-            with open(filename, "rb") as f:
+            with open(filepath, "rb") as f:
                 buf = f.read(8)
                 return buf.startswith(PAR_PKT_ID)
         except:
             pass
-    elif ".par2" in filename.lower():
-        return True
     return False
 
 
@@ -60,14 +78,13 @@ def analyse_par2(name: str, filepath: Optional[str] = None) -> Tuple[str, int, i
     """
     name = name.strip()
     vol = block = 0
-    m = PROBABLY_PAR2_RE.search(name)
-    if m:
+    if m := PROBABLY_PAR2_RE.search(name):
         setname = m.group(1)
         vol = m.group(2)
         block = m.group(3)
     else:
         # Base-par2 file
-        setname = os.path.splitext(name)[0].strip()
+        setname = get_basename(name).strip()
         # Could not parse the filename, need deep inspection
         # We already know it's a par2 from the is_parfile
         if filepath:
@@ -86,53 +103,142 @@ def analyse_par2(name: str, filepath: Optional[str] = None) -> Tuple[str, int, i
     return setname, vol, block
 
 
-def parse_par2_file(fname: str, md5of16k: Dict[bytes, str]) -> Dict[str, bytes]:
+def parse_par2_file(fname: str, md5of16k: Dict[bytes, str]) -> Tuple[str, Dict[str, FilePar2Info]]:
     """Get the hash table and the first-16k hash table from a PAR2 file
     Return as dictionary, indexed on names or hashes for the first-16 table
     The input md5of16k is modified in place and thus not returned!
 
+    Note that par2 can and will appear in random order, so the code has to collect data first
+    before we process them!
+
     For a full description of the par2 specification, visit:
     http://parchive.sourceforge.net/docs/specifications/parity-volume-spec/article-spec.html
     """
-    total_size = os.path.getsize(fname)
+    set_id = slice_size = coeff = nr_files = None
+    filepar2info = {}
+    filecrc32 = {}
     table = {}
     duplicates16k = []
-    total_nr_files = None
 
     try:
+        total_size = os.path.getsize(fname)
         with open(fname, "rb") as f:
-            header = f.read(8)
-            while header:
+            while header := f.read(8):
                 if header == PAR_PKT_ID:
-                    name, filehash, hash16k, nr_files = parse_par2_packet(f)
-                    if name:
-                        table[name] = filehash
-                        if hash16k not in md5of16k:
-                            md5of16k[hash16k] = name
-                        elif md5of16k[hash16k] != name:
-                            # Not unique and not already linked to this file
-                            # Remove to avoid false-renames
-                            duplicates16k.append(hash16k)
+                    # All packages start with a header before the body
+                    # 8	  : PAR2\x00PKT
+                    # 8	  : Length of the entire packet. Must be multiple of 4. (NB: Includes length of header.)
+                    # 16  : MD5 Hash of packet.
+                    # 16  : Recovery Set ID.
+                    # 16  : Type of packet.
+                    # ?*4 : Body of Packet. Must be a multiple of 4 bytes.
 
-                    # Store the number of files for later
-                    if nr_files:
-                        total_nr_files = nr_files
+                    # Length must be multiple of 4 and at least 20
+                    pack_len = struct.unpack("<Q", f.read(8))[0]
+                    if int(pack_len / 4) * 4 != pack_len or pack_len < 20:
+                        continue
+
+                    # Next 16 bytes is md5sum of this packet
+                    md5sum = f.read(16)
+
+                    # Read and check the data
+                    # Subtract 32 because we already read these bytes of the header
+                    data = f.read(pack_len - 32)
+                    if md5sum != hashlib.md5(data).digest():
+                        continue
+
+                    # See if it's any of the packages we care about
+                    par2_packet_type = data[16:32]
+
+                    # Get the Recovery Set ID
+                    set_id = data[:16].hex()
+
+                    if par2_packet_type == PAR_FILE_ID:
+                        # The FileDesc packet looks like:
+                        # 16 : "PAR 2.0\0FileDesc"
+                        # 16 : FileId
+                        # 16 : Hash for full file
+                        # 16 : Hash for first 16K
+                        #  8 : File length
+                        # xx : Name (multiple of 4, padded with \0 if needed)
+
+                        fileid = data[32:48].hex()
+                        if filepar2info.get(fileid):
+                            # Already have data
+                            continue
+                        hash16k = data[64:80]
+                        filesize = struct.unpack("<Q", data[80:88])[0]
+                        filename = correct_unknown_encoding(data[88:].strip(b"\0"))
+                        filepar2info[fileid] = FilePar2Info(filename, hash16k, filesize)
+                    elif par2_packet_type == PAR_CREATOR_ID:
+                        # From here until the end is the creator-text
+                        # Useful in case of bugs in the par2-creating software
+                        # "PAR 2.0\x00Creator\x00"
+                        par2creator = data[32:].strip(b"\0")  # Remove any trailing \0
+                        logging.debug(
+                            "Par2-creator of %s is: %s", os.path.basename(f.name), correct_unknown_encoding(par2creator)
+                        )
+                    elif par2_packet_type == PAR_MAIN_ID:
+                        # The Main packet looks like:
+                        # 16 : "PAR 2.0\0Main"
+                        # 8  : Slice size
+                        # 4  : Number of files in the recovery set
+                        slice_size = struct.unpack("<Q", data[32:40])[0]
+                        coeff = sabctools.crc32_xpow8n(slice_size)
+                        nr_files = struct.unpack("<I", data[40:44])[0]
+                    elif par2_packet_type == PAR_SLICE_ID:
+                        # "PAR 2.0\0IFSC\0\0\0\0"
+                        fileid = data[32:48].hex()
+                        if not filecrc32.get(fileid):
+                            filecrc32[fileid] = []
+                            for i in range(48, pack_len - 32, 20):
+                                filecrc32[fileid].append(struct.unpack("<I", data[i + 16 : i + 20])[0])
 
                     # On large files, we stop after seeing all the listings
                     # On smaller files, we scan them fully to get the par2-creator
-                    if total_size > SCAN_LIMIT and len(table) == total_nr_files:
+                    if total_size > SCAN_LIMIT and len(filepar2info) == nr_files:
                         break
 
-                header = f.read(8)
+            # Process all the data
+            for fileid in filepar2info.keys():
+                # Sanity check
+                par2info = filepar2info[fileid]
+                if not filecrc32.get(fileid) or not nr_files or not slice_size:
+                    logging.debug("Missing essential information for %s", par2info)
+                    continue
 
-    except (struct.error, IndexError):
-        logging.info('Cannot use corrupt par2 file for QuickCheck, "%s"', fname)
-        logging.debug("Traceback: ", exc_info=True)
-        table = {}
+                # Handle also cases where slice_size is exact match for filesize
+                # We currently don't have an unittest for that!
+                slices = par2info.filesize // slice_size
+                slice_nr = 0
+                crc32 = 0
+                while slice_nr < slices:
+                    crc32 = sabctools.crc32_multiply(crc32, coeff) ^ filecrc32[fileid][slice_nr]
+                    slice_nr += 1
+
+                if tail_size := par2info.filesize % slice_size:
+                    crc32 = sabctools.crc32_combine(
+                        crc32, sabctools.crc32_zero_unpad(filecrc32[fileid][-1], slice_size - tail_size), tail_size
+                    )
+                par2info.filehash = crc32
+
+                # We found hash data, add it to final tabel
+                table[par2info.filename] = par2info
+
+                # Check for md5of16k duplicates
+                if par2info.hash16k not in md5of16k:
+                    md5of16k[par2info.hash16k] = par2info.filename
+                elif md5of16k[par2info.hash16k] != par2info.filename:
+                    # Not unique and not already linked to this file
+                    # Mark and remove to avoid false-renames
+                    duplicates16k.append(par2info.hash16k)
+                    table[par2info.filename].has_duplicate = True
+
     except:
-        logging.info("QuickCheck parser crashed in file %s", fname)
+        logging.info("Par2 parser crashed in file %s", fname)
         logging.debug("Traceback: ", exc_info=True)
         table = {}
+        set_id = None
 
     # Have to remove duplicates at the end to make sure
     # no trace is left in case of multi-duplicates
@@ -141,62 +247,14 @@ def parse_par2_file(fname: str, md5of16k: Dict[bytes, str]) -> Dict[str, bytes]:
             old_name = md5of16k.pop(hash16k)
             logging.debug("Par2-16k signature of %s not unique, discarding", old_name)
 
-    return table
+    # Sort table by filename
+    # This is necessary because of the rare case that a set contains duplicate files.
+    # The crc32 quick check loops over files in the set and considered if they match an NzbFile.
+    # For example in a set with the packets in the order 003, 004, 001, 002 with 002 and 003 being identical files:
+    # We would start with 003 and the first match would be 002, therefore rename 002 to 003 overwriting the also
+    # downloaded 003 file.
+    # Finally, we would process 002 and the first unverified path will be 003 so rename 003 back to 002.
+    # The end result is we would have moved a single file from 002 to 003 to 002 and end up missing 003.
+    table = {filename: table[filename] for filename in sorted(table.keys())}
 
-
-def parse_par2_packet(f: BinaryIO) -> Tuple[Optional[str], Optional[bytes], Optional[bytes], Optional[int]]:
-    """Look up and analyze a PAR2 packet"""
-
-    filename, filehash, hash16k, nr_files = nothing = None, None, None, None
-
-    # All packages start with a header before the body
-    # 8	  : PAR2\x00PKT
-    # 8	  : Length of the entire packet. Must be multiple of 4. (NB: Includes length of header.)
-    # 16  : MD5 Hash of packet. Calculation starts at first byte of Recovery Set ID and ends at last byte of body.
-    # 16  : Recovery Set ID.
-    # 16  : Type of packet.
-    # ?*4 : Body of Packet. Must be a multiple of 4 bytes.
-
-    # Length must be multiple of 4 and at least 20
-    pack_len = struct.unpack("<Q", f.read(8))[0]
-    if int(pack_len / 4) * 4 != pack_len or pack_len < 20:
-        return nothing
-
-    # Next 16 bytes is md5sum of this packet
-    md5sum = f.read(16)
-
-    # Read and check the data
-    # Subtract 32 because we already read these bytes of the header
-    data = f.read(pack_len - 32)
-    md5 = hashlib.md5()
-    md5.update(data)
-    if md5sum != md5.digest():
-        return nothing
-
-    # See if it's any of the packages we care about
-    par2_packet_type = data[16:32]
-
-    if par2_packet_type == PAR_FILE_ID:
-        # The FileDesc packet looks like:
-        # 16 : "PAR 2.0\0FileDesc"
-        # 16 : FileId
-        # 16 : Hash for full file
-        # 16 : Hash for first 16K
-        #  8 : File length
-        # xx : Name (multiple of 4, padded with \0 if needed)
-        filehash = data[48:64]
-        hash16k = data[64:80]
-        filename = correct_unknown_encoding(data[88:].strip(b"\0"))
-    elif par2_packet_type == PAR_CREATOR_ID:
-        # From here until the end is the creator-text
-        # Useful in case of bugs in the par2-creating software
-        par2creator = data[32:].strip(b"\0")  # Remove any trailing \0
-        logging.debug("Par2-creator of %s is: %s", os.path.basename(f.name), correct_unknown_encoding(par2creator))
-    elif par2_packet_type == PAR_MAIN_ID:
-        # The Main packet looks like:
-        # 16 : "PAR 2.0\0Main"
-        # 8  : Slice size
-        # 4  : Number of files in the recovery set
-        nr_files = struct.unpack("<I", data[40:44])[0]
-
-    return filename, filehash, hash16k, nr_files
+    return set_id, table

@@ -1,3 +1,20 @@
+#!/usr/bin/python3 -OO
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
 """
 tests.test_nzbstuff - Testing functions in nzbstuff.py
 """
@@ -21,18 +38,17 @@ class TestNZO:
         nzo = nzbstuff.NzbObject("test_basic")
         assert nzo.work_name == "test_basic"
         assert not nzo.files
-        assert not nzo.created
 
         # Create NZB-file to import
-        nzb_data = create_and_read_nzb("basic_rar5")
+        nzb_fp = create_and_read_nzb_fp("basic_rar5")
 
         # Very basic test of NZO creation with data
-        nzo = nzbstuff.NzbObject("test_basic_data", nzb_data=nzb_data)
+        nzo = nzbstuff.NzbObject("test_basic_data", nzb_fp=nzb_fp)
         assert nzo.final_name == "test_basic_data"
         assert nzo.files
         assert nzo.files[0].filename == "testfile.rar"
-        assert nzo.bytes == 120
-        assert nzo.files[0].bytes == 120
+        assert nzo.bytes == 283
+        assert nzo.files[0].bytes == 283
 
         # work_name can be trimmed in Windows due to max-path-length
         assert "test_basic_data".startswith(nzo.work_name)
@@ -51,6 +67,52 @@ class TestNZO:
         # TODO: More checks!
 
 
+class Server:
+    def __init__(self, host, priority, active):
+        self.host = host
+        self.priority = priority
+        self.active = active
+
+
+class TestArticle:
+    def test_get_article(self):
+        article_id = "test@host" + os.urandom(8).hex() + ".sab"
+        article = nzbstuff.Article(article_id, randint(4321, 54321), None)
+        servers = []
+        servers.append(Server("testserver1", 10, True))
+        servers.append(Server("testserver2", 20, True))
+        servers.append(Server("testserver3", 30, True))
+
+        # Test fetching top priority server
+        server = servers[0]
+        assert article.get_article(server, servers) == article
+        assert article.fetcher_priority == 10
+        assert article.fetcher == server
+        assert article.get_article(server, servers) == None
+        article.fetcher = None
+        article.add_to_try_list(server)
+        assert article.get_article(server, servers) == None
+
+        # Test fetching when there is a higher priority server available
+        server = servers[2]
+        assert article.fetcher_priority == 10
+        assert article.get_article(server, servers) == None
+        assert article.fetcher_priority == 20
+
+        # Server should be used even if article.fetcher_priority is a higher number than server.priority
+        article.fetcher_priority = 30
+        server = servers[1]
+        assert article.get_article(server, servers) == article
+
+        # Inactive servers in servers list should be ignored
+        article.fetcher = None
+        article.fetcher_priority = 0
+        servers[1].active = False
+        server = servers[2]
+        assert article.get_article(server, servers) == article
+        assert article.tries == 3
+
+
 class TestNZBStuffHelpers:
     @pytest.mark.parametrize(
         "argument, name, password",
@@ -61,17 +123,21 @@ class TestNZBStuffHelpers:
             ("multiple_pw{{first-pw}}_{{second-pw}}", "multiple_pw", "first-pw}}_{{second-pw"),  # Greed is Good
             ("デビアン", "デビアン", None),  # Unicode
             ("Gentoo_Hobby_Edition {{secret}}", "Gentoo_Hobby_Edition", "secret"),  # Space between name and password
+            ("Test {{secret}}.nzb", "Test", "secret"),
             ("Mandrake{{top{{secret}}", "Mandrake", "top{{secret"),  # Double opening {{
             ("Красная}}{{Шляпа}}", "Красная}}", "Шляпа"),  # Double closing }}
             ("{{Jobname{{PassWord}}", "{{Jobname", "PassWord"),  # {{ at start
             ("Hello/kITTY", "Hello", "kITTY"),  # Notation with slash
+            ("Hello/kITTY.nzb", "Hello", "kITTY"),  # Notation with slash and extension
             ("/Jobname", "/Jobname", None),  # Slash at start
             ("Jobname/Top{{Secret}}", "Jobname", "Top{{Secret}}"),  # Slash with braces
             ("Jobname / Top{{Secret}}", "Jobname", "Top{{Secret}}"),  # Slash with braces and extra spaces
+            ("Jobname / Top{{Secret}}.nzb", "Jobname", "Top{{Secret}}"),
             ("לינוקס/معلومات سرية", "לינוקס", "معلومات سرية"),  # LTR with slash
             ("לינוקס{{معلومات سرية}}", "לינוקס", "معلومات سرية"),  # LTR with brackets
             ("thư điện tử password=mật_khẩu", "thư điện tử", "mật_khẩu"),  # Password= notation
             ("password=PartOfTheJobname", "password=PartOfTheJobname", None),  # Password= at the start
+            ("Job password=Test.par2", "Job", "Test"),  # Password= including extension
             ("Job}}Name{{FTW", "Job}}Name{{FTW", None),  # Both {{ and }} present but incorrect order (no password)
             ("./Text", "./Text", None),  # Name would end up empty after the function strips the dot
         ],
@@ -79,22 +145,23 @@ class TestNZBStuffHelpers:
     def test_scan_password(self, argument, name, password):
         assert nzbstuff.scan_password(argument) == (name, password)
 
-    def test_create_work_name(self):
+    @pytest.mark.parametrize(
+        "file_name, clean_file_name",
+        [
+            ("my_awesome_nzb_file.pAr2.nZb", "my_awesome_nzb_file"),
+            ("my_awesome_nzb_file.....pAr2.nZb", "my_awesome_nzb_file"),
+            ("my_awesome_nzb_file....par2..", "my_awesome_nzb_file"),
+            (" my_awesome_nzb_file  .pAr.nZb", "my_awesome_nzb_file"),
+            ("with.extension.and.period.par2.", "with.extension.and.period"),
+            ("nothing.in.here", "nothing.in.here"),
+            ("  just.space  ", "just.space"),
+            ("http://test.par2  ", "http://test.par2"),
+        ],
+    )
+    def test_create_work_name(self, file_name, clean_file_name):
         # Only test stuff specific for create_work_name
         # The sanitizing is already tested in tests for sanitize_foldername
-        file_names = {
-            "my_awesome_nzb_file.pAr2.nZb": "my_awesome_nzb_file",
-            "my_awesome_nzb_file.....pAr2.nZb": "my_awesome_nzb_file",
-            "my_awesome_nzb_file....par2..": "my_awesome_nzb_file",
-            " my_awesome_nzb_file  .pAr.nZb": "my_awesome_nzb_file",
-            "with.extension.and.period.par2.": "with.extension.and.period",
-            "nothing.in.here": "nothing.in.here",
-            "  just.space  ": "just.space",
-            "http://test.par2  ": "http://test.par2",
-        }
-
-        for file_name, clean_file_name in file_names.items():
-            assert nzbstuff.create_work_name(file_name) == clean_file_name
+        assert nzbstuff.create_work_name(file_name) == clean_file_name
 
     @pytest.mark.parametrize(
         "subject, filename",
@@ -133,14 +200,20 @@ class TestNZBStuffHelpers:
             ("Bla [Now it's done.exe]", "Now it's done.exe"),
             # If specified between [], the extension should be a valid one
             ("Bla [Now it's done.123nonsense]", "Bla [Now it's done.123nonsense]"),
+            ('[PRiVATE]-[WtFnZb]-[00000.clpi]-[1/46] - "" yEnc  788 (1/1)', "00000.clpi"),
             (
                 '[PRiVATE]-[WtFnZb]-[Video_(2001)_AC5.1_-RELEASE_[TAoE].mkv]-[1/23] - "" yEnc 1234567890 (1/23456)',
-                '[PRiVATE]-[WtFnZb]-[Video_(2001)_AC5.1_-RELEASE_[TAoE].mkv]-[1/23] - "" yEnc 1234567890 (1/23456)',
+                "Video_(2001)_AC5.1_-RELEASE_[TAoE].mkv",
             ),
             (
-                "[PRiVATE]-[WtFnZb]-[219]-[1/serie.name.s01e01.1080p.web.h264-group.mkv] - "
+                "[PRiVATE]-[WtFnZb]-[219]-[1/series.name.s01e01.1080p.web.h264-group.mkv] - "
                 " yEnc (1/[PRiVATE] \\c2b510b594\\::686ea969999193.155368eba4965e56a8cd263382e012.f2712fdc::/97bd201cf931/) 1 (1/0)",
-                "serie.name.s01e01.1080p.web.h264-group.mkv",
+                "series.name.s01e01.1080p.web.h264-group.mkv",
+            ),
+            (
+                "[PRiVATE]-[WtFnZb]-[/More.Bla.S02E01.1080p.WEB.h264-EDITH[eztv.re].mkv-WtF[nZb]/"
+                'More.Bla.S02E01.1080p.WEB.h264-EDITH.mkv]-[1/2] - "" yEnc  2990558544 (1/4173)',
+                "More.Bla.S02E01.1080p.WEB.h264-EDITH[eztv.re].mkv",
             ),
         ],
     )

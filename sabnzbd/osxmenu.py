@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -19,14 +19,44 @@
 sabnzbd.osxmenu - macOS Top Menu
 """
 
-from Foundation import *
-from AppKit import *
-from objc import YES, NO
-
 import os
 import sys
 import time
 import logging
+from typing import Optional
+
+from objc import YES, NO, lookUpClass
+from Foundation import (
+    NSObject,
+    NSDate,
+    NSTimer,
+    NSRunLoop,
+    NSDefaultRunLoopMode,
+    NSColor,
+    NSFont,
+    NSImage,
+    NSAttributedString,
+    NSUserNotification,
+    NSUserNotificationCenter,
+)
+from AppKit import (
+    NSStatusBar,
+    NSMenu,
+    NSMenuItem,
+    NSAlternateKeyMask,
+    NSTerminateNow,
+    NSEventTrackingRunLoopMode,
+    NSVariableStatusItemLength,
+    NSForegroundColorAttributeName,
+    NSFontAttributeName,
+    NSOnState,
+    NSOffState,
+    NSBaselineOffsetAttributeName,
+    NSParagraphStyleAttributeName,
+    NSMutableParagraphStyle,
+    NSParagraphStyle,
+    NSCenterTextAlignment,
+)
 
 import sabnzbd
 import sabnzbd.cfg
@@ -39,6 +69,8 @@ from sabnzbd.panic import launch_a_browser
 from sabnzbd.api import fast_queue
 import sabnzbd.config as config
 
+DefaultUserNotificationCenter = NSUserNotificationCenter.defaultUserNotificationCenter()
+
 status_icons = {
     "idle": "icons/sabnzbd_osx_idle.tiff",
     "pause": "icons/sabnzbd_osx_pause.tiff",
@@ -48,14 +80,20 @@ start_time = NSDate.date()
 
 
 class SABnzbdDelegate(NSObject):
-
     icons = {}
     status_bar = None
     history_db = None
 
     def awakeFromNib(self):
+        # Wait for SABnzbd to be ready, otherwise tray_icon might not be read from config yet
+        while not sabnzbd.WEBUI_READY and not sabnzbd.SABSTOP:
+            time.sleep(0.5)
+
+        # Set this thread as default handler for notification actions
+        DefaultUserNotificationCenter.setDelegate_(self)
+
         # Do we want the menu
-        if sabnzbd.cfg.osx_menu():
+        if sabnzbd.cfg.tray_icon():
             # Status Bar initialize
             self.buildMenu()
 
@@ -85,15 +123,9 @@ class SABnzbdDelegate(NSObject):
         self.status_item.setToolTip_("SABnzbd")
         self.status_item.setEnabled_(YES)
 
-        # Wait for translated texts to be loaded
-        while not sabnzbd.WEBUI_READY and not sabnzbd.SABSTOP:
-            time.sleep(0.5)
-
         # Variables
         self.state = "Idle"
         self.speed = 0
-        self.version_notify = 1
-        self.status_removed = 0
 
         # Menu construction
         self.menu = NSMenu.alloc().init()
@@ -112,6 +144,7 @@ class SABnzbdDelegate(NSObject):
         self.menu.addItem_(self.state_menu_item)
 
         # Queue Item
+        self.menu_queue = None
         self.queue_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             T("Queue"), "openBrowserAction:", ""
         )
@@ -127,6 +160,7 @@ class SABnzbdDelegate(NSObject):
         self.menu.addItem_(self.purgequeue_menu_item)
 
         # History Item
+        self.menu_history = None
         self.history_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             T("History"), "openBrowserAction:", ""
         )
@@ -245,31 +279,33 @@ class SABnzbdDelegate(NSObject):
 
     def queueUpdate(self):
         try:
-            qnfo = sabnzbd.NzbQueue.queue_info(start=0, limit=10)
+            queue_bytes_total, queue_bytes_left, _, nzo_list, _, queue_fullsize = sabnzbd.NzbQueue.queue_info(limit=10)
             bytesleftprogess = 0
             self.info = ""
-            self.menu_queue = NSMenu.alloc().init()
 
-            if qnfo.list:
+            if not self.menu_queue:
+                self.menu_queue = NSMenu.alloc().init()
+            self.menu_queue.removeAllItems()
+
+            if nzo_list:
                 menu_queue_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                     T("Queue First 10 Items"), "", ""
                 )
                 self.menu_queue.addItem_(menu_queue_item)
                 self.menu_queue.addItem_(NSMenuItem.separatorItem())
 
-                for pnfo in qnfo.list:
-                    bytesleft = pnfo.bytes_left / MEBI
-                    bytesleftprogess += pnfo.bytes_left
-                    bytes_total = pnfo.bytes / MEBI
+                for nzo in nzo_list:
+                    bytesleft = nzo.remaining / MEBI
+                    bytesleftprogess += nzo.remaining
+                    bytes_total = nzo.bytes / MEBI
                     timeleft = sabnzbd.api.calc_timeleft(bytesleftprogess, sabnzbd.BPSMeter.bps)
-                    job = "%s\t(%d/%d MB) %s" % (pnfo.filename, bytesleft, bytes_total, timeleft)
-                    menu_queue_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(job, "", "")
-                    self.menu_queue.addItem_(menu_queue_item)
+                    job = "%s\t(%d/%d MB) %s" % (nzo.filename, bytesleft, bytes_total, timeleft)
+                    self.menu_queue.addItem_(NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(job, "", ""))
 
                 self.info = "%d nzb(s)\t(%d / %d MB)" % (
-                    qnfo.q_size_list,
-                    (qnfo.bytes_left / MEBI),
-                    (qnfo.bytes / MEBI),
+                    queue_fullsize,
+                    (queue_bytes_left / MEBI),
+                    (queue_bytes_total / MEBI),
                 )
             else:
                 menu_queue_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(T("Empty"), "", "")
@@ -285,11 +321,10 @@ class SABnzbdDelegate(NSObject):
                 self.history_db = sabnzbd.database.HistoryDB()
             items = self.history_db.fetch_history(limit=10)[0]
 
-            self.menu_history = NSMenu.alloc().init()
-            self.failedAttributes = {
-                NSForegroundColorAttributeName: NSColor.redColor(),
-                NSFontAttributeName: NSFont.menuFontOfSize_(14.0),
-            }
+            if not self.menu_history:
+                self.menu_history = NSMenu.alloc().init()
+            self.menu_history.removeAllItems()
+
             menu_history_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 T("History Last 10 Items"), "", ""
             )
@@ -308,10 +343,14 @@ class SABnzbdDelegate(NSObject):
                         )
                     if history["status"] != Status.COMPLETED:
                         jobfailed = NSAttributedString.alloc().initWithString_attributes_(
-                            history["name"], self.failedAttributes
+                            history["name"],
+                            {
+                                NSForegroundColorAttributeName: NSColor.redColor(),
+                                NSFontAttributeName: NSFont.menuFontOfSize_(14.0),
+                            },
                         )
                         menu_history_item.setAttributedTitle_(jobfailed)
-                    menu_history_item.setRepresentedObject_("%s" % history["storage"])
+                    menu_history_item.setRepresentedObject_(history["storage"])
                     self.menu_history.addItem_(menu_history_item)
             else:
                 menu_history_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(T("Empty"), "", "")
@@ -356,16 +395,7 @@ class SABnzbdDelegate(NSObject):
                 if "M" in speed and len(speed) > 5:
                     speed = speed.replace(" ", "")
                 time_left = (bpsnow > 10 and time_left) or "------"
-
-                statusbarText = "\n\n%s\n%sB/s\n" % (time_left, speed)
-
-                if sabnzbd.SABSTOP:
-                    statusbarText = "..."
-
-                if not sabnzbd.cfg.osx_speed():
-                    statusbarText = ""
-
-                self.setMenuTitle_(statusbarText)
+                self.setMenuTitle_("\n\n%s\n%sB/s\n" % (time_left, speed))
             else:
                 self.state = T("Idle")
                 self.setMenuTitle_("")
@@ -397,13 +427,12 @@ class SABnzbdDelegate(NSObject):
 
     def speedlimitUpdate(self):
         try:
-            speed = int(sabnzbd.Downloader.get_limit())
-            if self.speed != speed:
-                self.speed = speed
+            if self.speed != sabnzbd.Downloader.bandwidth_perc:
+                self.speed = sabnzbd.Downloader.bandwidth_perc
                 speedsValues = self.menu_speed.numberOfItems()
                 for i in range(speedsValues):
                     menuitem = self.menu_speed.itemAtIndex_(i)
-                    if speed == int(menuitem.representedObject()):
+                    if sabnzbd.Downloader.bandwidth_perc == int(menuitem.representedObject()):
                         menuitem.setState_(NSOnState)
                     else:
                         menuitem.setState_(NSOffState)
@@ -459,7 +488,7 @@ class SABnzbdDelegate(NSObject):
         elif mode == "history":
             if not self.history_db:
                 self.history_db = sabnzbd.database.HistoryDB()
-            self.history_db.remove_history()
+            self.history_db.remove_with_status(Status.COMPLETED)
 
     def pauseAction_(self, sender):
         minutes = int(sender.representedObject())
@@ -489,8 +518,8 @@ class SABnzbdDelegate(NSObject):
         self.setMenuTitle_("\n\n%s\n" % (T("Stopping...")))
 
     def restartSafeHost_(self, sender):
-        sabnzbd.cfg.cherryhost.set("127.0.0.1")
-        sabnzbd.cfg.cherryport.set("8080")
+        sabnzbd.cfg.web_host.set("127.0.0.1")
+        sabnzbd.cfg.web_port.set("8080")
         sabnzbd.cfg.enable_https.set(False)
         sabnzbd.config.save_config()
         self.setMenuTitle_("\n\n%s\n" % (T("Stopping...")))
@@ -512,7 +541,7 @@ class SABnzbdDelegate(NSObject):
             logging.info("[osx] receiving from macOS : %s", filename)
             if os.path.exists(filename):
                 if sabnzbd.filesystem.get_ext(filename) in VALID_ARCHIVES + VALID_NZB_FILES:
-                    sabnzbd.add_nzbfile(filename, keep=True)
+                    sabnzbd.nzbparser.add_nzbfile(filename, keep=True)
         # logging.info('opening done')
 
     def applicationShouldTerminate_(self, sender):
@@ -521,3 +550,45 @@ class SABnzbdDelegate(NSObject):
         self.status_item.setHighlightMode_(NO)
         sabnzbd.shutdown_program()
         return NSTerminateNow
+
+    def send_notification(
+        self,
+        title: str,
+        subtitle: str,
+        msg: str,
+        button_text: Optional[str] = None,
+        button_action: Optional[str] = None,
+    ):
+        """Send a macOS notification, optionally with 1 action button"""
+        notification = NSUserNotification.alloc().init()
+        notification.setTitle_(title)
+        notification.setSubtitle_(subtitle)
+        notification.setInformativeText_(msg)
+        notification.setSoundName_("NSUserNotificationDefaultSoundName")
+
+        if button_text and button_action:
+            notification.setHasActionButton_(True)
+            notification.set_showsButtons_(True)
+            notification.setActionButtonTitle_(button_text)
+            notification.setUserInfo_({"value": button_action})
+        else:
+            notification.setHasActionButton_(False)
+            notification.set_showsButtons_(False)
+
+        notification.setDeliveryDate_(NSDate.dateWithTimeInterval_sinceDate_(0, NSDate.date()))
+        DefaultUserNotificationCenter.scheduleNotification_(notification)
+
+    def userNotificationCenter_didActivateNotification_(self, center, notification):
+        """Handler for the clicks on the notification"""
+
+        if notification.activationType() == 1:
+            # user clicked on the notification (not on a button)
+            launch_a_browser(sabnzbd.BROWSER_URL, force=True)
+
+        elif notification.activationType() == 2:
+            # User clicked on the action button
+            if os.path.exists(folder2open := notification.userInfo()["value"]):
+                os.system('open "%s"' % folder2open)
+
+        # Remove this notification after interaction
+        DefaultUserNotificationCenter._removeDisplayedNotification_(notification)

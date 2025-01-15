@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -31,7 +31,7 @@ class TestRSS:
     def setup_rss(feed_name, feed_url):
         """Setup the basic settings to get things going"""
         # Setup the config settings
-        sabnzbd.config.CFG = configobj.ConfigObj()
+        sabnzbd.config.CFG_OBJ = configobj.ConfigObj()
         sabnzbd.config.ConfigRSS(feed_name, {"uri": feed_url})
 
         # Need to create the Default category

@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -92,7 +92,7 @@ def osx_shutdown():
 def osx_standby():
     """Make macOS system sleep, returns after wakeup"""
     try:
-        subprocess.call(["osascript", "-e", 'tell app "System Events" to sleep'])
+        subprocess.call(["pmset", "sleepnow"])
         time.sleep(10)
     except:
         logging.error(T("Failed to standby system"))

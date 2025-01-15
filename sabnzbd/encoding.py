@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -36,7 +36,7 @@ def utob(str_in: AnyStr) -> bytes:
 
 def ubtou(str_in: AnyStr) -> str:
     """Shorthand for converting unicode bytes to UTF-8 string"""
-    if not isinstance(str_in, bytes):
+    if isinstance(str_in, str):
         return str_in
     return str_in.decode("utf-8")
 
@@ -77,6 +77,22 @@ def correct_unknown_encoding(str_or_bytes_in: AnyStr) -> str:
             return str_or_bytes_in.decode(chardet.detect(str_or_bytes_in)["encoding"])
 
 
-def xml_name(p):
-    """Prepare name for use in HTML/XML contect"""
-    return escape(str(p))
+def correct_cherrypy_encoding(inputstring: str) -> str:
+    """convert inputstring with separate, individual chars (1-255) to valid string (with UTF8 encoding)"""
+    try:
+        return inputstring.encode("raw_unicode_escape").decode("utf8")
+    except:
+        # not possible to convert to UTF8, so don't change anything:
+        return inputstring
+
+
+def xml_name(input_value) -> str:
+    """Prepare name for use in HTML/XML context"""
+    if input_value is not None:
+        return escape(str(input_value))
+    return ""
+
+
+def limit_encoded_length(inputstring: str, max_length: int) -> str:
+    """Limit the actual codepoint length of a string"""
+    return inputstring.encode("utf-8", errors="replace")[:max_length].decode(errors="ignore")

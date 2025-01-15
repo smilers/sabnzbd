@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -31,6 +31,7 @@ from tavern.core import run
 from warnings import warn
 
 import sabnzbd.interface as interface
+from sabnzbd.constants import DEF_SORTER_RENAME_SIZE
 from sabnzbd.misc import from_units
 
 from tests.testhelper import *
@@ -42,12 +43,6 @@ class ApiTestFunctions:
     def _get_api_json(self, mode, extra_args={}):
         """Wrapper for API calls with json output"""
         extra = {"output": "json", "apikey": SAB_APIKEY}
-        extra.update(extra_args)
-        return get_api_result(mode=mode, host=SAB_HOST, port=SAB_PORT, extra_arguments=extra)
-
-    def _get_api_text(self, mode, extra_args={}):
-        """Wrapper for API calls with text output"""
-        extra = {"output": "text", "apikey": SAB_APIKEY}
         extra.update(extra_args)
         return get_api_result(mode=mode, host=SAB_HOST, port=SAB_PORT, extra_arguments=extra)
 
@@ -198,9 +193,6 @@ class TestOtherApi(ApiTestFunctions):
     def test_api_version_json(self):
         assert self._get_api_json("version")["version"] == sabnzbd.__version__
 
-    def test_api_version_text(self):
-        assert self._get_api_text("version").rstrip() == sabnzbd.__version__
-
     def test_api_version_xml(self):
         assert self._get_api_xml("version")["version"] == sabnzbd.__version__
 
@@ -235,8 +227,8 @@ class TestOtherApi(ApiTestFunctions):
                 float(self._get_api_json("queue")["queue"]["speedlimit_abs"]), abs=1, rel=0.005
             ) == speed_pct / 100 * from_units(linespeed)
         else:
-            assert int(json["queue"]["speedlimit"]) == 100
-            assert bool(json["queue"]["speedlimit_abs"]) is False
+            assert int(json["queue"]["speedlimit"]) == 0
+            assert int(json["queue"]["speedlimit_abs"]) == 0
 
     @pytest.mark.parametrize(
         "test_with_units, limit_pct, should_limit",
@@ -264,7 +256,7 @@ class TestOtherApi(ApiTestFunctions):
             if round(limit_pct / 100 * linespeed_value) > 20:
                 speed_abs = str(round(limit_pct / 100 * linespeed_value)) + "M"
             else:
-                speed_abs = str(round(limit_pct * 2 ** 10 * linespeed_value / 100)) + "K"
+                speed_abs = str(round(limit_pct * 2**10 * linespeed_value / 100)) + "K"
         else:
             speed_abs = str(round(limit_pct / 100 * from_units(linespeed)))
         assert self._get_api_json("config", extra_args={"name": "speedlimit", "value": speed_abs})["status"] is True
@@ -278,8 +270,8 @@ class TestOtherApi(ApiTestFunctions):
                 == from_units(speed_abs) / from_units(linespeed) * 100
             )
         else:
-            assert bool(json["queue"]["speedlimit_abs"]) is False
-            assert int(json["queue"]["speedlimit"]) == 100
+            assert int(json["queue"]["speedlimit_abs"]) == 0
+            assert int(json["queue"]["speedlimit"]) == 0
 
     @pytest.mark.parametrize(
         "language, value, translation",
@@ -318,7 +310,7 @@ class TestOtherApi(ApiTestFunctions):
     def test_api_get_clear_warnings(self):
         # Trigger warnings by sending requests with a truncated apikey
         for _ in range(0, 2):
-            assert interface._MSG_APIKEY_INCORRECT in self._get_api_text(
+            assert interface._MSG_APIKEY_INCORRECT in self._get_api_json(
                 "shutdown", extra_args={"apikey": SAB_APIKEY[:-1]}
             )
 
@@ -344,7 +336,7 @@ class TestOtherApi(ApiTestFunctions):
     def test_api_pause_resume_pp(self):  # TODO include this in the queue output, like the other pause states?
         # Very basic test only, pp pause state cannot be verified for now
         assert self._get_api_json("pause_pp")["status"] is True
-        assert self._get_api_text("resume_pp").startswith("ok")
+        assert self._get_api_json("resume_pp")["status"] is True
 
     @pytest.mark.parametrize("set_watched_dir", [False, True])
     def test_api_watched_now(self, set_watched_dir):
@@ -375,10 +367,6 @@ class TestOtherApi(ApiTestFunctions):
             )
 
         # Reset the quota and verify the response for all output types
-        text = self._get_api_text("reset_quota")
-        assert len(text) > 0  # Test for issue #1161
-        assert text.strip() == "ok"
-
         xml = self._get_api_xml("reset_quota")
         assert len(xml) > 0  # Test for issue #1161
         assert xml["result"]["status"] == "True"
@@ -405,6 +393,85 @@ class TestOtherApi(ApiTestFunctions):
                 "set_config",
                 extra_args={"apikey": json[name], "section": "misc", "keyword": keyword, "value": "apikey"},
             )
+
+    @pytest.mark.parametrize("identifier", ["name", "keyword"])
+    @pytest.mark.parametrize(
+        "sorter_name, sorter_conf",
+        [
+            [
+                "MyFirstSorter",
+                {
+                    "order": 0,
+                    "min_size": "1234K",
+                    "multipart_label": "CD%1",
+                    "sort_string": "%title (%y)/%title (%y).%ext",
+                    "sort_cats": ["*", "test"],
+                    "sort_type": [3],
+                    "is_active": 0,
+                },
+            ],
+            [
+                "MySecondSorter",
+                {
+                    "order": randint(0, 99),
+                    "min_size": "666G",
+                    "multipart_label": "",
+                    "sort_string": "%s_n/my series S%0sE%0e.%ext",
+                    "sort_cats": ["tv"],
+                    "sort_type": [1, 2],
+                    "is_active": 1,
+                },
+            ],
+            [
+                "MyThirdSorter",
+                {
+                    "order": 42,
+                    "sort_string": "%s_n/my series S%0sE%0e.%ext",
+                    "sort_cats": ["tv"],
+                    "sort_type": [1, 2],
+                    "is_active": 1,
+                },  # Intentionally leave out min_size and multipart_label
+            ],
+        ],
+    )
+    def test_api_handle_sorter_api(self, identifier, sorter_name, sorter_conf):
+        """Test handling of set_config for sorters"""
+        # Set a sorter via the api
+        extra_args = {"section": "sorters", identifier: sorter_name}
+        extra_args.update(sorter_conf)
+        json_set = self._get_api_json(mode="set_config", extra_args=extra_args)
+
+        # Get the configured sorter
+        json_get = self._get_api_json(mode="get_config", extra_args={"section": "sorters", "keyword": sorter_name})
+
+        # Verify the result; responses to both commands should be identical
+        for json in json_set, json_get:
+            assert json["config"]["sorters"]
+            for setting, value in json["config"]["sorters"][0].items():
+                if configured_value := sorter_conf.get(setting):
+                    assert value == configured_value
+                else:
+                    # Check against the default value for anything not specified in sorter_conf
+                    if setting == "min_size":
+                        assert value == DEF_SORTER_RENAME_SIZE
+                    if setting == "multipart_label":
+                        assert value == ""
+
+        # Remove sorter
+        json_del = self._get_api_json(
+            mode="del_config",
+            extra_args={
+                "section": "sorters",
+                "keyword": sorter_name,
+            },
+        )
+        assert json_del["status"] == True
+
+        # Try getting the deleted sorter again and make sure it's actually gone
+        json_get_again = self._get_api_json(
+            mode="get_config", extra_args={"section": "sorters", "keyword": sorter_name}
+        )
+        assert json_get_again["config"] == {}
 
 
 @pytest.mark.usefixtures("run_sabnzbd")
@@ -530,28 +597,13 @@ class TestQueueApi(ApiTestFunctions):
             (True, False, "hibernate_pc"),
             (True, False, "standby_pc"),
             (True, True, "shutdown_program"),
-            (True, True, "script_Sample-PostProc.py"),
-            (False, False, "script_Sample-PostProc.py"),
             (False, False, "invalid_option"),
-            (False, True, "script_foobar.py"),  # Doesn't exist, see issue #1650
-            (False, True, "script_" + os.path.join("..", "SABnzbd.py")),  # Outside the scriptsdir, #1650 again
-            (False, True, "script_" + os.path.join("..", "..", "SABnzbd.py")),
-            (False, True, "script_" + os.path.join("..", "..", "..", "SABnzbd.py")),
-            (False, True, "script_"),  # Empty after removal of the prefix
-            (True, True, "script_my_script_for_sab.py"),  # Test for #1651
-            (False, True, "my_script_for_sab.py"),
         ],
     )
     def test_api_queue_change_complete_action(self, should_work, set_scriptsdir, value):
         # To safeguard against actually triggering any of the actions, pause the
         # queue and add some random job before setting any end-of-queue actions.
         self._create_random_queue(minimum_size=1)
-
-        # Setup the script_dir as ordered
-        script_dir = ""
-        if set_scriptsdir:
-            script_dir = "scripts"
-        self._setup_script_dir(script_dir, script="my_script_for_sab.py")
 
         # Run the queue complete action api call
         prev_value = self._get_api_json("queue")["queue"]["finishaction"]
@@ -615,7 +667,7 @@ class TestQueueApi(ApiTestFunctions):
         def size_in_bytes(size):
             # Helper function for list.sort() to deal with B/KB/MB in size values
             if size.endswith(" MB"):
-                return float(size.strip(" MB")) * 1024 ** 2
+                return float(size.strip(" MB")) * 1024**2
             if size.endswith(" KB"):
                 return float(size.strip(" KB")) * 1024
             if size.endswith(" B"):
@@ -704,7 +756,10 @@ class TestQueueApi(ApiTestFunctions):
             ("my_scripted_script_.py", True, True),
             ("유닉스.py", True, True),
             pytest.param(
-                "유닉스.sh", True, True, marks=pytest.mark.skipif(sys.platform.startswith("win"), reason="Not for Windows")
+                "유닉스.sh",
+                True,
+                True,
+                marks=pytest.mark.skipif(sys.platform.startswith("win"), reason="Not for Windows"),
             ),
             pytest.param(
                 "لغة برمجة نصية",
@@ -807,7 +862,7 @@ class TestQueueApi(ApiTestFunctions):
             ("thư điện tử password=mật_khẩu", None, "thư điện tử", "mật_khẩu", True),
             ("{{Jobname{{PassWord}}", None, "{{Jobname", "PassWord", True),  # Issue #1659
             ("password=PartOfTheJobname", None, "password=PartOfTheJobname", None, True),  # Issue #1659
-            ("/Jobname", None, "+Jobname", None, True),  # Issue #1659
+            ("/Jobname", None, "_Jobname", None, True),  # Issue #1659
             ("", None, None, None, False),
             ("", "PassWord", None, "PassWord", False),
             (None, None, None, None, False),

@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -18,9 +18,13 @@
 """
 sabnzbd.misc - misc classes
 """
+
 import os
+import platform
+import ssl
 import sys
 import logging
+import functools
 import urllib.request
 import urllib.parse
 import re
@@ -29,29 +33,34 @@ import socket
 import time
 import datetime
 import inspect
+import queue
 import ctypes
+import html
 import ipaddress
-from typing import Union, Tuple, Any, AnyStr, Optional, List
+import socks
+from threading import Thread
+from collections.abc import Iterable
+from typing import Union, Tuple, Any, AnyStr, Optional, List, Dict, Collection
 
 import sabnzbd
-from sabnzbd.constants import DEFAULT_PRIORITY, MEBI, DEF_ARTICLE_CACHE_DEFAULT, DEF_ARTICLE_CACHE_MAX
+import sabnzbd.getipaddress
+from sabnzbd.constants import (
+    DEFAULT_PRIORITY,
+    MEBI,
+    DEF_ARTICLE_CACHE_DEFAULT,
+    DEF_ARTICLE_CACHE_MAX,
+    REPAIR_REQUEST,
+    GUESSIT_SORT_TYPES,
+)
 import sabnzbd.config as config
 import sabnzbd.cfg as cfg
+from sabnzbd.decorators import cache_maintainer
 from sabnzbd.encoding import ubtou, platform_btou
-from sabnzbd.filesystem import userxbit
+from sabnzbd.filesystem import userxbit, make_script_path, remove_file
 
-TAB_UNITS = ("", "K", "M", "G", "T", "P")
-RE_UNITS = re.compile(r"(\d+\.*\d*)\s*([KMGTP]?)", re.I)
-RE_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)([a-zA-Z]*)(\d*)")
-RE_SAMPLE = re.compile(r"((^|[\W_])(sample|proof))", re.I)  # something-sample or something-proof
-RE_IP4 = re.compile(r"inet\s+(addr:\s*)?(\d+\.\d+\.\d+\.\d+)")
-RE_IP6 = re.compile(r"inet6\s+(addr:\s*)?([0-9a-f:]+)", re.I)
-
-# Check if strings are defined for AM and PM
-HAVE_AMPM = bool(time.strftime("%p", time.localtime()))
-
-if sabnzbd.WIN32:
+if sabnzbd.WINDOWS:
     try:
+        import winreg
         import win32process
         import win32con
 
@@ -65,6 +74,34 @@ if sabnzbd.WIN32:
     except ImportError:
         pass
 
+if sabnzbd.MACOS:
+    from sabnzbd.utils import sleepless
+
+TAB_UNITS = ("", "K", "M", "G", "T", "P")
+RE_UNITS = re.compile(r"(\d+\.*\d*)\s*([KMGTP]?)", re.I)
+RE_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)([a-zA-Z]*)(\d*)")
+RE_SAMPLE = re.compile(r"((^|[\W_])(sample|proof))", re.I)  # something-sample or something-proof
+RE_IP4 = re.compile(r"inet\s+(addr:\s*)?(\d+\.\d+\.\d+\.\d+)")
+RE_IP6 = re.compile(r"inet6\s+(addr:\s*)?([0-9a-f:]+)", re.I)
+
+# Check if strings are defined for AM and PM
+HAVE_AMPM = bool(time.strftime("%p"))
+
+
+def helpful_warning(msg, *args, **kwargs):
+    """Wrapper to ignore helpful warnings if desired"""
+    if cfg.helpful_warnings():
+        msg = "%s\n%s" % (msg, T("To prevent all helpful warnings, disable Special setting 'helpful_warnings'."))
+        return logging.warning(msg, *args, **kwargs)
+    return logging.info(msg, *args, **kwargs)
+
+
+def duplicate_warning(*args, **kwargs):
+    """Wrapper to ignore duplicate warnings if desired"""
+    if cfg.warn_dupl_jobs():
+        return logging.warning(*args, **kwargs)
+    return logging.info(*args, **kwargs)
+
 
 def time_format(fmt):
     """Return time-format string adjusted for 12/24 hour clock setting"""
@@ -72,6 +109,33 @@ def time_format(fmt):
         return fmt.replace("%H:%M:%S", "%I:%M:%S %p").replace("%H:%M", "%I:%M %p")
     else:
         return fmt
+
+
+def format_time_left(totalseconds: int, short_format: bool = False) -> str:
+    """Calculate the time left in the format [DD:]HH:MM:SS or [DD:][HH:]MM:SS (short_format)"""
+    if totalseconds > 0:
+        try:
+            minutes, seconds = divmod(totalseconds, 60)
+            hours, minutes = divmod(minutes, 60)
+            days, hours = divmod(hours, 24)
+            if seconds < 10:
+                seconds = "0%s" % seconds
+            if hours > 0 or not short_format:
+                if minutes < 10:
+                    minutes = "0%s" % minutes
+                if days > 0:
+                    if hours < 10:
+                        hours = "0%s" % hours
+                    return "%s:%s:%s:%s" % (days, hours, minutes, seconds)
+                else:
+                    return "%s:%s:%s" % (hours, minutes, seconds)
+            else:
+                return "%s:%s" % (minutes, seconds)
+        except:
+            pass
+    if short_format:
+        return "0:00"
+    return "0:00:00"
 
 
 def calc_age(date: datetime.datetime, trans: bool = False) -> str:
@@ -87,38 +151,47 @@ def calc_age(date: datetime.datetime, trans: bool = False) -> str:
         d = "d"
         h = "h"
         m = "m"
+
     try:
-        now = datetime.datetime.now()
-        # age = str(now - date).split(".")[0] #old calc_age
-
-        # time difference
-        dage = now - date
-        seconds = dage.seconds
-        # only one value should be returned
-        # if it is less than 1 day then it returns in hours, unless it is less than one hour where it returns in minutes
-        if dage.days:
-            age = "%d%s" % (dage.days, d)
-        elif int(seconds / 3600):
-            age = "%d%s" % (seconds / 3600, h)
+        # Return time difference in human-readable format
+        date_diff = datetime.datetime.now() - date
+        if date_diff.days:
+            return "%d%s" % (date_diff.days, d)
+        elif int(date_diff.seconds / 3600):
+            return "%d%s" % (date_diff.seconds / 3600, h)
         else:
-            age = "%d%s" % (seconds / 60, m)
+            return "%d%s" % (date_diff.seconds / 60, m)
     except:
-        age = "-"
-
-    return age
+        return "-"
 
 
 def safe_lower(txt: Any) -> str:
     """Return lowercased string. Return '' for None"""
-    if txt:
+    if txt := str_conv(txt):
         return txt.lower()
-    else:
-        return ""
+    return ""
+
+
+def is_none(inp: Any) -> bool:
+    """Check for 'not X' but also if it's maybe the string 'None'"""
+    return not inp or (isinstance(inp, str) and inp.lower() == "none")
+
+
+def clean_comma_separated_list(inp: Any) -> List[str]:
+    """Return a list of stripped values from a string or list, empty ones removed"""
+    result_ids = []
+    if isinstance(inp, str):
+        inp = inp.split(",")
+    if isinstance(inp, Iterable):
+        for inp_id in inp:
+            if new_id := inp_id.strip():
+                result_ids.append(new_id)
+    return result_ids
 
 
 def cmp(x, y):
     """
-    Replacement for built-in funciton cmp that was removed in Python 3
+    Replacement for built-in function cmp that was removed in Python 3
 
     Compare the two objects x and y and return an integer according to
     the outcome. The return value is negative if x < y, zero if x == y
@@ -126,6 +199,38 @@ def cmp(x, y):
     """
 
     return (x > y) - (x < y)
+
+
+class MultiAddQueue(queue.Queue):
+    def put_multiple(self, multiple_items: Collection):
+        """Take advantage of the dequeue used by Queue that has a very
+        fast extend method to add multiple items at once.
+        See: https://github.com/sabnzbd/sabnzbd/discussions/2704"""
+        with self.not_full:
+            self.queue.extend(multiple_items)
+            self.unfinished_tasks += len(multiple_items)
+            self.not_empty.notify()
+
+
+def cat_pp_script_sanitizer(
+    cat: Optional[str] = None,
+    pp: Optional[Union[int, str]] = None,
+    script: Optional[str] = None,
+) -> Tuple[Optional[Union[int, str]], Optional[str], Optional[str]]:
+    """Basic sanitizer from outside input to a bit more predictable values"""
+    # * and Default are valid values
+    if safe_lower(cat) in ("", "none"):
+        cat = None
+
+    # Cannot use "not pp" because pp can also be 0
+    if safe_lower(pp) in ("", "-1", "none"):
+        pp = None
+
+    # Check for valid script is performed in NzbObject init
+    if not script or safe_lower(script) == "default":
+        script = None
+
+    return cat, pp, script
 
 
 def name_to_cat(fname, cat=None):
@@ -173,10 +278,10 @@ def cat_to_opts(cat, pp=None, script=None, priority=None) -> Tuple[str, int, str
     return cat, pp, script, priority
 
 
-def pp_to_opts(pp: int) -> Tuple[bool, bool, bool]:
+def pp_to_opts(pp: Optional[int]) -> Tuple[bool, bool, bool]:
     """Convert numeric processing options to (repair, unpack, delete)"""
     # Convert the pp to an int
-    pp = sabnzbd.interface.int_conv(pp)
+    pp = int_conv(pp)
     if pp == 0:
         return False, False, False
     if pp == 1:
@@ -188,14 +293,23 @@ def pp_to_opts(pp: int) -> Tuple[bool, bool, bool]:
 
 def opts_to_pp(repair: bool, unpack: bool, delete: bool) -> int:
     """Convert (repair, unpack, delete) to numeric process options"""
-    pp = 0
-    if repair:
-        pp = 1
-    if unpack:
-        pp = 2
     if delete:
-        pp = 3
-    return pp
+        return 3
+    if unpack:
+        return 2
+    if repair:
+        return 1
+    return 0
+
+
+def sort_to_opts(sort_type: str) -> int:
+    """Convert a guessed sort_type to its integer equivalent"""
+    for k, v in GUESSIT_SORT_TYPES.items():
+        if v == sort_type:
+            return k
+    else:
+        logging.debug("Invalid sort_type %s, pretending a match to 0 ('all')", sort_type)
+        return 0
 
 
 _wildcard_to_regex = {
@@ -244,7 +358,7 @@ def cat_convert(cat):
     If no match found, but the indexer-cat starts with the user-cat, return user-cat
     If no match found, return None
     """
-    if cat and cat.lower() != "none":
+    if not is_none(cat):
         cats = config.get_ordered_categories()
         raw_cats = config.get_categories()
         for ucat in cats:
@@ -284,8 +398,6 @@ _SERVICE_PARM = "CommandLine"
 
 def get_serv_parms(service):
     """Get the service command line parameters from Registry"""
-    import winreg
-
     service_parms = []
     try:
         key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _SERVICE_KEY + service)
@@ -305,8 +417,6 @@ def get_serv_parms(service):
 
 def set_serv_parms(service, args):
     """Set the service command line parameters in Registry"""
-    import winreg
-
     serv = []
     for arg in args:
         serv.append(arg[0])
@@ -337,8 +447,7 @@ def convert_version(text):
     """Convert version string to numerical value and a testversion indicator"""
     version = 0
     test = True
-    m = RE_VERSION.search(ubtou(text))
-    if m:
+    if m := RE_VERSION.search(ubtou(text)):
         version = int(m.group(1)) * 1000000 + int(m.group(2)) * 10000 + int(m.group(3)) * 100
         try:
             if m.group(4).lower() == "rc":
@@ -365,7 +474,7 @@ def check_latest_version():
     Formula for the version numbers (line 1 and 3).
         <major>.<minor>.<bugfix>[rc|beta|alpha]<cand>
 
-    The <cand> value for a final version is assumned to be 99.
+    The <cand> value for a final version is assumed to be 99.
     The <cand> value for the beta/rc version is 1..98, with RC getting
     a boost of 80 and Beta of 40.
     This is done to signal alpha/beta/rc users of availability of the final
@@ -386,7 +495,7 @@ def check_latest_version():
     # Fetch version info
     data = get_from_url("https://sabnzbd.org/latest.txt")
     if not data:
-        logging.info("Cannot retrieve version information from GitHub.com")
+        logging.info("Cannot retrieve version information from sabnzbd.org")
         logging.debug("Traceback: ", exc_info=True)
         return
 
@@ -461,12 +570,13 @@ def upload_file_to_sabnzbd(url, fp):
 
 
 def from_units(val: str) -> float:
-    """Convert K/M/G/T/P notation to float"""
+    """Convert K/M/G/T/P notation to float
+    Does not support negative numbers"""
     val = str(val).strip().upper()
     if val == "-1":
         return float(val)
-    m = RE_UNITS.search(val)
-    if m:
+
+    if m := RE_UNITS.search(val):
         if m.group(2):
             val = float(m.group(1))
             unit = m.group(2)
@@ -487,30 +597,29 @@ def from_units(val: str) -> float:
 def to_units(val: Union[int, float], postfix="") -> str:
     """Convert number to K/M/G/T/P notation
     Show single decimal for M and higher
+    Also supports negative numbers
     """
-    dec_limit = 1
+    if not isinstance(val, (int, float)):
+        return ""
+
     if val < 0:
         sign = "-"
     else:
         sign = ""
-    val = str(abs(val)).strip()
 
+    # Determine what form we are at
+    val = abs(val)
     n = 0
-    try:
-        val = float(val)
-    except:
-        return ""
-    while (val > 1023.0) and (n < 5):
-        val = val / 1024.0
+    while (val > 1023) and (n < 5):
+        val = val / 1024
         n = n + 1
-    unit = TAB_UNITS[n]
-    if n > dec_limit:
+
+    if n > 1:
         decimals = 1
     else:
         decimals = 0
 
-    fmt = "%%s%%.%sf %%s%%s" % decimals
-    return fmt % (sign, val, unit, postfix)
+    return ("%%s%%.%sf %%s%%s" % decimals) % (sign, val, TAB_UNITS[n], postfix)
 
 
 def caller_name(skip=2):
@@ -540,8 +649,13 @@ def caller_name(skip=2):
 
 def exit_sab(value: int):
     """Leave the program after flushing stderr/stdout"""
-    sys.stderr.flush()
-    sys.stdout.flush()
+    try:
+        sys.stderr.flush()
+        sys.stdout.flush()
+    except AttributeError:
+        # Not supported on Windows binaries
+        pass
+
     # Cannot use sys.exit as it will not work inside the macOS-runner-thread
     os._exit(value)
 
@@ -575,12 +689,12 @@ def get_cache_limit():
     """
     # Calculate, if possible
     try:
-        if sabnzbd.WIN32:
+        if sabnzbd.WINDOWS:
             # Windows
             mem_bytes = get_windows_memory()
-        elif sabnzbd.DARWIN:
+        elif sabnzbd.MACOS:
             # macOS
-            mem_bytes = get_darwin_memory()
+            mem_bytes = get_macos_memory()
         else:
             # Linux
             mem_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
@@ -599,7 +713,7 @@ def get_cache_limit():
         pass
 
     # Always at least minimum on Windows/macOS
-    if sabnzbd.WIN32 and sabnzbd.DARWIN:
+    if sabnzbd.WINDOWS and sabnzbd.MACOS:
         return DEF_ARTICLE_CACHE_DEFAULT
 
     # If failed, leave empty for Linux so user needs to decide
@@ -632,23 +746,110 @@ def get_windows_memory():
     return stat.ullTotalPhys
 
 
-def get_darwin_memory():
+def get_macos_memory():
     """Use system-call to extract total memory on macOS"""
     system_output = run_command(["sysctl", "hw.memsize"])
     return float(system_output.split()[1])
 
 
-def on_cleanup_list(filename, skip_nzb=False):
+@cache_maintainer(clear_time=3600)
+@functools.lru_cache(maxsize=None)
+def get_cpu_name():
+    """Find the CPU name (which needs a different method per OS), and return it
+    If none found, return platform.platform()"""
+
+    cputype = None
+
+    try:
+        if sabnzbd.WINDOWS:
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"Hardware\Description\System\CentralProcessor\0")
+            cputype = winreg.QueryValueEx(key, "ProcessorNameString")[0]
+            winreg.CloseKey(key)
+
+        elif sabnzbd.MACOS:
+            cputype = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"]).strip()
+
+        else:
+            with open("/proc/cpuinfo") as fp:
+                for myline in fp.readlines():
+                    if myline.startswith("model name"):
+                        # Typical line:
+                        # model name      : Intel(R) Xeon(R) CPU           E5335  @ 2.00GHz
+                        cputype = myline.split(":", 1)[1]  # get everything after the first ":"
+                        break  # we're done
+        cputype = platform_btou(cputype)
+    except:
+        # An exception, maybe due to a subprocess call gone wrong
+        pass
+
+    if cputype:
+        # OK, found. Remove unwanted spaces:
+        cputype = " ".join(cputype.split())
+    else:
+        try:
+            # Not found, so let's fall back to platform()
+            cputype = platform.platform()
+        except:
+            # Can fail on special platforms (like Snapcraft or embedded)
+            pass
+
+    logging.debug("CPU model = %s", cputype)
+    return cputype
+
+
+def get_platform_description() -> str:
+    """Get a nicer description of what platform we are on"""
+    platform_tags = []
+    # We dig deeper for Linux
+    if not sabnzbd.WINDOWS and not sabnzbd.MACOS:
+        # Check if running in a Docker container
+        # Note: fake-able, but good enough for normal setups
+        if os.path.exists("/.dockerenv"):
+            platform_tags.append("Docker")
+            # See if we are on Unraid
+            if "HOST_OS" in os.environ and os.environ["HOST_OS"].lower() == "unraid":
+                platform_tags.append("Unraid")
+        elif "container" in os.environ:
+            platform_tags.append("Flatpak")
+        elif "APPIMAGE" in os.environ:
+            platform_tags.append("AppImage")
+        elif "SNAP" in os.environ:
+            platform_tags.append("Snap")
+        else:
+            # Check for other forms of virtualization
+            try:
+                if virt := run_command(["systemd-detect-virt"]).strip():
+                    if virt != "none":
+                        platform_tags.append(virt)
+            except:
+                pass
+
+            try:
+                # Only present in Python 3.10+
+                # Can print nicer description like "Ubuntu 24.02 LTS"
+                platform_tags.append(platform.freedesktop_os_release()["PRETTY_NAME"])
+            except:
+                pass
+
+    if not platform_tags:
+        # Fallback if we found nothing or on Windows/macOS
+        platform_tags.append(platform.platform(terse=True))
+
+    # Add all together
+    sabnzbd.PLATFORM = " ".join(platform_tags)
+    return sabnzbd.PLATFORM
+
+
+def on_cleanup_list(filename: str, skip_nzb: bool = False) -> bool:
     """Return True if a filename matches the clean-up list"""
-    lst = cfg.cleanup_list()
-    if lst:
+    cleanup_list = cfg.cleanup_list()
+    if cleanup_list:
         name, ext = os.path.splitext(filename)
         ext = ext.strip().lower()
         name = name.strip()
-        for k in lst:
-            item = k.strip().strip(".").lower()
-            item = "." + item
-            if (item == ext or (ext == "" and item == name)) and not (skip_nzb and item == ".nzb"):
+        for cleanup_ext in cleanup_list:
+            cleanup_ext = "." + cleanup_ext
+            if (cleanup_ext == ext or (ext == "" and cleanup_ext == name)) and not (skip_nzb and cleanup_ext == ".nzb"):
                 return True
     return False
 
@@ -678,19 +879,17 @@ _HAVE_STATM = _PAGE_SIZE and memory_usage()
 def loadavg():
     """Return 1, 5 and 15 minute load average of host or "" if not supported"""
     p = ""
-    if not sabnzbd.WIN32 and not sabnzbd.DARWIN:
-        opt = cfg.show_sysload()
-        if opt:
-            try:
-                p = "%.2f | %.2f | %.2f" % os.getloadavg()
-            except:
-                pass
-            if opt > 1 and _HAVE_STATM:
-                p = "%s | %s" % (p, memory_usage())
+    if not sabnzbd.WINDOWS and not sabnzbd.MACOS:
+        try:
+            p = "%.2f | %.2f | %.2f" % os.getloadavg()
+        except:
+            pass
+        if _HAVE_STATM:
+            p = "%s | %s" % (p, memory_usage())
     return p
 
 
-def format_time_string(seconds):
+def format_time_string(seconds: float) -> str:
     """Return a formatted and translated time string"""
 
     def unit(single, n):
@@ -726,13 +925,30 @@ def format_time_string(seconds):
     return " ".join(completestr)
 
 
-def int_conv(value: Any) -> int:
-    """Safe conversion to int (can handle None)"""
+def str_conv(value: Any, default: str = "") -> str:
+    """Safe conversion to str (None will be converted to empty string)
+    Returns empty string or requested default value"""
+    if value is None:
+        return default
     try:
-        value = int(value)
+        return str(value)
     except:
-        value = 0
-    return value
+        return default
+
+
+def int_conv(value: Any, default: int = 0) -> int:
+    """Safe conversion to int (can handle None)
+    Returns 0 or requested default value"""
+    try:
+        return int(value)
+    except:
+        return default
+
+
+def bool_conv(value: Any) -> bool:
+    """Safe conversion to bool (can handle None)
+    Returns False in case of None or non-convertable value"""
+    return bool(int_conv(value))
 
 
 def create_https_certificates(ssl_cert, ssl_key):
@@ -752,20 +968,20 @@ def create_https_certificates(ssl_cert, ssl_key):
 
 
 def get_all_passwords(nzo) -> List[str]:
-    """Get all passwords, from the NZB, meta and password file. In case the correct password is
-    already known, only that password is returned."""
+    """Get all passwords, from the NZB, meta and password file. In case a working password is
+    already known, try it first."""
+    passwords = []
     if nzo.correct_password:
-        return [nzo.correct_password]
+        passwords.append(nzo.correct_password)
 
     if nzo.password:
         logging.info("Found a password that was set by the user: %s", nzo.password)
-        passwords = [nzo.password.strip()]
-    else:
-        passwords = []
+        passwords.append(nzo.password.strip())
 
+    # Note that we get a reference to the list, so adding to it updates the original list!
     meta_passwords = nzo.meta.get("password", [])
     pw = nzo.nzo_info.get("password")
-    if pw:
+    if pw and pw not in meta_passwords:
         meta_passwords.append(pw)
 
     if meta_passwords:
@@ -785,7 +1001,7 @@ def get_all_passwords(nzo) -> List[str]:
 
             # Check size
             if len(pws) > 30:
-                logging.warning_helpful(
+                helpful_warning(
                     T(
                         "Your password file contains more than 30 passwords, testing all these passwords takes a lot of time. Try to only list useful passwords."
                     )
@@ -816,7 +1032,7 @@ def is_sample(filename: str) -> bool:
 
 def find_on_path(targets):
     """Search the PATH for a program and return full path"""
-    if sabnzbd.WIN32:
+    if sabnzbd.WINDOWS:
         paths = os.getenv("PATH").split(";")
     else:
         paths = os.getenv("PATH").split(":")
@@ -924,6 +1140,15 @@ def is_lan_addr(ip: str) -> bool:
         return False
 
 
+def is_local_addr(ip: str) -> bool:
+    """Determine if an IP address is to be considered local, i.e. it's part of a subnet in
+    local_ranges, if defined, or in private address space reserved for local area networks."""
+    if local_ranges := cfg.local_ranges():
+        return any(ip_in_subnet(ip, local_range) for local_range in local_ranges)
+    else:
+        return is_lan_addr(ip)
+
+
 def ip_extract() -> List[str]:
     """Return list of IP addresses of this system"""
     ips = []
@@ -935,7 +1160,7 @@ def ip_extract() -> List[str]:
         if program:
             program = [program]
 
-    if sabnzbd.WIN32 or not program:
+    if sabnzbd.WINDOWS or not program:
         try:
             info = socket.getaddrinfo(socket.gethostname(), None)
         except:
@@ -952,42 +1177,6 @@ def ip_extract() -> List[str]:
             if m and m.group(2):
                 ips.append(m.group(2))
     return ips
-
-
-def get_server_addrinfo(host: str, port: int) -> socket.getaddrinfo:
-    """Return processed getaddrinfo()"""
-    try:
-        int(port)
-    except:
-        port = 119
-    opt = sabnzbd.cfg.ipv6_servers()
-    """ ... with the following meaning for 'opt':
-    Control the use of IPv6 Usenet server addresses. Meaning:
-    0 = don't use
-    1 = use when available and reachable (DEFAULT)
-    2 = force usage (when SABnzbd's detection fails)
-    """
-    try:
-        # Standard IPV4 or IPV6
-        ips = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
-        if opt == 2 or (opt == 1 and sabnzbd.EXTERNAL_IPV6) or (opt == 1 and sabnzbd.cfg.load_balancing() == 2):
-            # IPv6 forced by user, or IPv6 allowed and reachable, or IPv6 allowed and loadbalancing-with-IPv6 activated
-            # So return all IP addresses, no matter IPv4 or IPv6:
-            return ips
-        else:
-            # IPv6 unreachable or not allowed by user, so only return IPv4 address(es):
-            return [ip for ip in ips if ":" not in ip[4][0]]
-    except:
-        if opt == 2 or (opt == 1 and sabnzbd.EXTERNAL_IPV6) or (opt == 1 and sabnzbd.cfg.load_balancing() == 2):
-            try:
-                # Try IPV6 explicitly
-                return socket.getaddrinfo(
-                    host, port, socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_IP, socket.AI_CANONNAME
-                )
-            except:
-                # Nothing found!
-                pass
-        return []
 
 
 def get_base_url(url: str) -> str:
@@ -1014,33 +1203,43 @@ def match_str(text: AnyStr, matches: Tuple[AnyStr, ...]) -> Optional[AnyStr]:
     return None
 
 
-def nntp_to_msg(text: Union[List[AnyStr], str]) -> str:
-    """Format raw NNTP bytes data for display"""
-    if isinstance(text, list):
-        text = text[0]
+def recursive_html_escape(input_dict_or_list: Union[Dict[str, Any], List], exclude_items: Tuple[str, ...] = ()):
+    """Recursively update the input_dict in-place with html-safe values"""
+    if isinstance(input_dict_or_list, (dict, list)):
+        if isinstance(input_dict_or_list, dict):
+            iterator = input_dict_or_list.items()
+        else:
+            # For lists we use enumerate
+            iterator = enumerate(input_dict_or_list)
 
-    # Only need to split if it was raw data
-    # Sometimes (failed login) we put our own texts
-    if not isinstance(text, bytes):
-        return text
+        for key, value in iterator:
+            # Ignore any keys that are not safe to convert
+            if key not in exclude_items:
+                # We ignore any other than str
+                if isinstance(value, str):
+                    input_dict_or_list[key] = html.escape(value, quote=True)
+                if isinstance(value, (dict, list)):
+                    recursive_html_escape(value, exclude_items=exclude_items)
     else:
-        lines = text.split(b"\r\n")
-        return ubtou(lines[0])
+        raise ValueError("Expected dict or str, got %s" % type(input_dict_or_list))
 
 
-def list2cmdline(lst: List[str]) -> str:
-    """convert list to a cmd.exe-compatible command string"""
+def list2cmdline_unrar(lst: List[str]) -> str:
+    """convert list to a unrar.exe-compatible command string
+    Unrar uses "" instead of \" to escape the double quote"""
     nlst = []
     for arg in lst:
         if not arg:
             nlst.append('""')
         else:
+            if isinstance(arg, str):
+                arg = arg.replace('"', '""')
             nlst.append('"%s"' % arg)
     return " ".join(nlst)
 
 
-def build_and_run_command(command: List[str], flatten_command=False, **kwargs):
-    """Builds and then runs command with nessecary flags and optional
+def build_and_run_command(command: List[str], windows_unrar_command: bool = False, text_mode: bool = True, **kwargs):
+    """Builds and then runs command with necessary flags and optional
     IONice and Nice commands. Optional Popen arguments can be supplied.
     On Windows we need to run our own list2cmdline for Unrar.
     Returns the Popen-instance.
@@ -1050,7 +1249,7 @@ def build_and_run_command(command: List[str], flatten_command=False, **kwargs):
         logging.error(T("[%s] The command in build_command is undefined."), caller_name())
         raise IOError
 
-    if not sabnzbd.WIN32:
+    if not sabnzbd.WINDOWS:
         if command[0].endswith(".py"):
             with open(command[0], "r") as script_file:
                 if not userxbit(command[0]):
@@ -1075,8 +1274,8 @@ def build_and_run_command(command: List[str], flatten_command=False, **kwargs):
         # For Windows we always need to add python interpreter
         if command[0].endswith(".py"):
             command.insert(0, "python.exe")
-        if flatten_command:
-            command = list2cmdline(command)
+        if windows_unrar_command:
+            command = list2cmdline_unrar(command)
         # On some Windows platforms we need to suppress a quick pop-up of the command window
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags = win32process.STARTF_USESHOWWINDOW
@@ -1085,12 +1284,18 @@ def build_and_run_command(command: List[str], flatten_command=False, **kwargs):
 
     # Set the basic Popen arguments
     popen_kwargs = {
-        "stdin": subprocess.PIPE,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
+        "bufsize": 0,
         "startupinfo": startupinfo,
         "creationflags": creationflags,
     }
+
+    # In text mode we ignore errors
+    if text_mode:
+        # We default to utf8, and hope for the best
+        popen_kwargs.update({"text": True, "encoding": "utf8", "errors": "replace"})
+
     # Update with the supplied ones
     popen_kwargs.update(kwargs)
 
@@ -1103,6 +1308,259 @@ def build_and_run_command(command: List[str], flatten_command=False, **kwargs):
 def run_command(cmd: List[str], **kwargs):
     """Run simple external command and return output as a string."""
     with build_and_run_command(cmd, **kwargs) as p:
-        txt = platform_btou(p.stdout.read())
+        txt = p.stdout.read()
         p.wait()
     return txt
+
+
+def run_script(script: str):
+    """Run a user script"""
+    if script_path := make_script_path(script):
+        try:
+            script_output = run_command([script_path], env=sabnzbd.newsunpack.create_env())
+            logging.info("Output of script %s: \n%s", script, script_output)
+        except:
+            logging.info("Failed script %s, Traceback: ", script, exc_info=True)
+
+
+def set_socks5_proxy():
+    if cfg.socks5_proxy_url():
+        proxy = urllib.parse.urlparse(cfg.socks5_proxy_url())
+        logging.info("Using Socks5 proxy %s:%s", proxy.hostname, proxy.port)
+        socks.set_default_proxy(
+            socks.SOCKS5,
+            proxy.hostname,
+            proxy.port,
+            True,  # use remote DNS, default
+            proxy.username,
+            proxy.password,
+        )
+        socket.socket = socks.socksocket
+
+
+def set_https_verification(value):
+    """Set HTTPS-verification state while returning current setting
+    False = disable verification
+    """
+    prev = ssl._create_default_https_context == ssl.create_default_context
+    if value:
+        ssl._create_default_https_context = ssl.create_default_context
+    else:
+        ssl._create_default_https_context = ssl._create_unverified_context
+    return prev
+
+
+def request_repair():
+    """Request a full repair on next restart"""
+    path = os.path.join(cfg.admin_dir.get_path(), REPAIR_REQUEST)
+    try:
+        with open(path, "w") as f:
+            f.write("\n")
+    except:
+        pass
+
+
+def check_repair_request():
+    """Return True if repair request found, remove afterwards"""
+    path = os.path.join(cfg.admin_dir.get_path(), REPAIR_REQUEST)
+    if os.path.exists(path):
+        try:
+            remove_file(path)
+        except:
+            pass
+        return True
+    return False
+
+
+def system_shutdown():
+    """Shutdown system after halting download and saving bookkeeping"""
+    logging.info("Performing system shutdown")
+
+    # Do not use regular shutdown, as we should be able to still send system-shutdown
+    Thread(target=sabnzbd.halt).start()
+    while sabnzbd.__INITIALIZED__:
+        time.sleep(1.0)
+
+    if sabnzbd.WINDOWS:
+        sabnzbd.powersup.win_shutdown()
+    elif sabnzbd.MACOS:
+        sabnzbd.powersup.osx_shutdown()
+    else:
+        sabnzbd.powersup.linux_shutdown()
+
+
+def system_hibernate():
+    """Hibernate system"""
+    logging.info("Performing system hybernation")
+    if sabnzbd.WINDOWS:
+        sabnzbd.powersup.win_hibernate()
+    elif sabnzbd.MACOS:
+        sabnzbd.powersup.osx_hibernate()
+    else:
+        sabnzbd.powersup.linux_hibernate()
+
+
+def system_standby():
+    """Standby system"""
+    logging.info("Performing system standby")
+    if sabnzbd.WINDOWS:
+        sabnzbd.powersup.win_standby()
+    elif sabnzbd.MACOS:
+        sabnzbd.powersup.osx_standby()
+    else:
+        sabnzbd.powersup.linux_standby()
+
+
+def change_queue_complete_action(action: str, new: bool = True):
+    """Action or script to be performed once the queue has been completed"""
+    function = None
+    if new or cfg.queue_complete_pers():
+        if action == "shutdown_pc":
+            function = system_shutdown
+        elif action == "hibernate_pc":
+            function = system_hibernate
+        elif action == "standby_pc":
+            function = system_standby
+        elif action == "shutdown_program":
+            function = sabnzbd.shutdown_program
+        else:
+            action = None
+    else:
+        action = None
+
+    if new:
+        cfg.queue_complete.set(action or "")
+        config.save_config()
+
+    sabnzbd.QUEUECOMPLETE = action
+    sabnzbd.QUEUECOMPLETEACTION = function
+
+
+def keep_awake():
+    """If we still have work to do, keep Windows/macOS system awake"""
+    if sabnzbd.KERNEL32 or sabnzbd.FOUNDATION:
+        if sabnzbd.cfg.keep_awake():
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            if (not sabnzbd.Downloader.no_active_jobs() and not sabnzbd.NzbQueue.is_empty()) or (
+                not sabnzbd.PostProcessor.paused and not sabnzbd.PostProcessor.empty()
+            ):
+                if sabnzbd.KERNEL32:
+                    # Set ES_SYSTEM_REQUIRED until the next call
+                    sabnzbd.KERNEL32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+                else:
+                    sleepless.keep_awake("SABnzbd is busy downloading and/or post-processing")
+            else:
+                if sabnzbd.KERNEL32:
+                    # Allow the regular state again
+                    sabnzbd.KERNEL32.SetThreadExecutionState(ES_CONTINUOUS)
+                else:
+                    sleepless.allow_sleep()
+
+
+def history_updated():
+    """To make sure we always have a fresh history"""
+    sabnzbd.LAST_HISTORY_UPDATE += 1
+    # Never go over the limit
+    if sabnzbd.LAST_HISTORY_UPDATE + 1 >= sys.maxsize:
+        sabnzbd.LAST_HISTORY_UPDATE = 1
+
+
+def convert_sorter_settings():
+    """Convert older tv/movie/date sorter settings to the new universal sorter
+
+    The old settings used:
+    -enable_tv_sorting = OptionBool("misc", "enable_tv_sorting", False)
+    -tv_sort_string = OptionStr("misc", "tv_sort_string")
+    -tv_categories = OptionList("misc", "tv_categories", ["tv"])
+
+    -enable_movie_sorting = OptionBool("misc", "enable_movie_sorting", False)
+    -movie_sort_string = OptionStr("misc", "movie_sort_string")
+    -movie_sort_extra = OptionStr("misc", "movie_sort_extra", "-cd%1", strip=False)
+    -movie_categories = OptionList("misc", "movie_categories", ["movies"])
+
+    -enable_date_sorting = OptionBool("misc", "enable_date_sorting", False)
+    -date_sort_string = OptionStr("misc", "date_sort_string")
+    -date_categories = OptionList("misc", "date_categories", ["tv"])
+
+    -movie_rename_limit = OptionStr("misc", "movie_rename_limit", "100M")
+    -episode_rename_limit = OptionStr("misc", "episode_rename_limit", "20M")
+
+    The new settings define a sorter as follows (cf. class config.ConfigSorter):
+    name: str {
+        name: str
+        order: int
+        min_size: Union[str|int] = "50M"
+        multipart_label: Optional[str] = ""
+        sort_string: str
+        sort_cats: List[str]
+        sort_type: List[int]
+        is_active: bool = 1
+    }
+
+    With the old settings, sorting was tried in a fixed order (series first, movies last);
+    that order is retained by the conversion code.
+    We only convert enabled sorters."""
+
+    # Keep track of order
+    order = 0
+
+    if cfg.enable_tv_sorting() and cfg.tv_sort_string() and cfg.tv_categories():
+        # Define a new sorter based on the old configuration
+        tv_sorter = {}
+        tv_sorter["order"] = order
+        tv_sorter["min_size"] = cfg.episode_rename_limit()
+        tv_sorter["multipart_label"] = ""  # Previously only available for movie sorting
+        tv_sorter["sort_string"] = cfg.tv_sort_string()
+        tv_sorter["sort_cats"] = cfg.tv_categories()
+        tv_sorter["sort_type"] = [sort_to_opts("tv")]
+        tv_sorter["is_active"] = int(cfg.enable_tv_sorting())
+
+        # Configure the new sorter
+        logging.debug("Converted old series sorter config to '%s': %s", T("Series Sorting"), tv_sorter)
+        config.ConfigSorter(T("Series Sorting"), tv_sorter)
+        order += 1
+
+    if cfg.enable_date_sorting() and cfg.date_sort_string() and cfg.date_categories():
+        date_sorter = {}
+        date_sorter["order"] = order
+        date_sorter["min_size"] = cfg.episode_rename_limit()
+        date_sorter["multipart_label"] = ""  # Previously only available for movie sorting
+        date_sorter["sort_string"] = cfg.date_sort_string()
+        date_sorter["sort_cats"] = cfg.date_categories()
+        date_sorter["sort_type"] = [sort_to_opts("date")]
+        date_sorter["is_active"] = int(cfg.enable_date_sorting())
+
+        # Configure the new sorter
+        logging.debug("Converted old date sorter config to '%s': %s", T("Date Sorting"), date_sorter)
+        config.ConfigSorter(T("Date Sorting"), date_sorter)
+        order += 1
+
+    if cfg.enable_movie_sorting() and cfg.movie_sort_string() and cfg.movie_categories():
+        movie_sorter = {}
+        movie_sorter["order"] = order
+        movie_sorter["min_size"] = cfg.movie_rename_limit()
+        movie_sorter["multipart_label"] = cfg.movie_sort_extra()
+        movie_sorter["sort_string"] = cfg.movie_sort_string()
+        movie_sorter["sort_cats"] = cfg.movie_categories()
+        movie_sorter["sort_type"] = [sort_to_opts("movie")]
+        movie_sorter["is_active"] = int(cfg.enable_movie_sorting())
+
+        # Configure the new sorter
+        logging.debug("Converted old movie sorter config to '%s': %s", T("Movie Sorting"), movie_sorter)
+        config.ConfigSorter(T("Movie Sorting"), movie_sorter)
+
+
+def convert_history_retention():
+    """Convert single-option to the split history retention setting"""
+    if "d" in cfg.history_retention():
+        days_to_keep = int_conv(cfg.history_retention().strip()[:-1])
+        cfg.history_retention_option.set("days-delete")
+        cfg.history_retention_number.set(days_to_keep)
+    else:
+        to_keep = int_conv(sabnzbd.cfg.history_retention())
+        if to_keep > 0:
+            cfg.history_retention_option.set("number-delete")
+            cfg.history_retention_number.set(to_keep)
+        elif to_keep < 0:
+            cfg.history_retention_option.set("all-delete")

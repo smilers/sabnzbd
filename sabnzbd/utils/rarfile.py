@@ -1132,7 +1132,9 @@ class CommonParser(object):
 
             # now read actual header
             return self._parse_block_header(fd)
-        except struct.error:
+        except:
+            # SABnzbd-edit:
+            # Catch all errors
             self._set_error("Broken header in RAR file")
             return None
 
@@ -1193,7 +1195,6 @@ class CommonParser(object):
         return DirectReader(self, inf)
 
     def _open_hack_core(self, inf, psw, prefix, suffix):
-
         size = inf.compress_size + inf.header_size
         rf = XFile(inf.volume_file, 0)
         rf.seek(inf.header_offset)
@@ -1323,7 +1324,7 @@ class RAR3Parser(CommonParser):
 
         pos = S_BLK_HDR.size
 
-        # block has data assiciated with it?
+        # block has data associated with it?
         if h.flags & RAR_LONG_BLOCK:
             h.add_size, pos = load_le32(hdata, pos)
         else:
@@ -1373,7 +1374,7 @@ class RAR3Parser(CommonParser):
             "Header CRC error (%02x): exp=%x got=%x (xlen = %d)", h.type, h.header_crc, calc_crc, len(crcdat)
         )
 
-        # instead panicing, send eof
+        # instead panicking, send eof
         return None
 
     # read file-specific header
@@ -1461,7 +1462,6 @@ class RAR3Parser(CommonParser):
         return pos
 
     def _read_comment_v3(self, inf, psw=None):
-
         # read data
         with XFile(inf.volume_file) as rf:
             rf.seek(inf.data_offset)
@@ -2896,6 +2896,10 @@ def custom_popen(cmd):
     creationflags = 0
     if sys.platform == "win32":
         creationflags = 0x08000000  # CREATE_NO_WINDOW
+        # We need to patch the special UnRar escaping of double quotes on Windows
+        from sabnzbd.misc import list2cmdline_unrar
+
+        cmd = list2cmdline_unrar(cmd)
 
     # run command
     try:

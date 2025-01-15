@@ -1,10 +1,8 @@
 SABnzbd - The automated Usenet download tool
 ============================================
 
-![CI tests](https://github.com/sabnzbd/sabnzbd/workflows/CI%20Tests/badge.svg)
-![Build binaries](https://github.com/sabnzbd/sabnzbd/workflows/Build%20binaries%20and%20source%20distribution/badge.svg)
-[![License](https://img.shields.io/badge/license-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
-
+[![License](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
+[![Join our Discord](https://img.shields.io/discord/976737547558461480?color=7289DA&label=Discord&logo=Discord&logoColor=white)](https://discord.sabnzbd.org)
 
 SABnzbd is an Open Source Binary Newsreader written in Python.
 
@@ -18,7 +16,7 @@ If you want to know more you can head over to our website: https://sabnzbd.org.
 
 SABnzbd has a few dependencies you'll need before you can get running. If you've previously run SABnzbd from one of the various Linux packages, then you likely already have all the needed dependencies. If not, here's what you're looking for:
 
-- `python` (Python 3.7 and above, often called `python3`)
+- `python` (Python 3.8 and above, often called `python3`)
 - Python modules listed in `requirements.txt`. Install with `python3 -m pip install -r requirements.txt -U`
 - `par2` (Multi-threaded par2 installation guide can be found [here](https://sabnzbd.org/wiki/installation/multicore-par2))
 - `unrar` (make sure you get the "official" non-free version of unrar)

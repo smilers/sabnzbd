@@ -13,7 +13,7 @@ from cryptography.x509.oid import NameOID
 import datetime
 import socket
 
-from sabnzbd.getipaddress import localipv4
+from sabnzbd.getipaddress import local_ipv4
 
 
 def generate_key(key_size=2048, output_file="key.pem"):
@@ -29,8 +29,7 @@ def generate_key(key_size=2048, output_file="key.pem"):
             private_key.private_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=serialization.NoEncryption()
-                # encryption_algorithm=serialization.BestAvailableEncryption(b"passphrase")
+                encryption_algorithm=serialization.NoEncryption(),
             )
         )
 
@@ -64,7 +63,7 @@ def generate_local_cert(private_key, days_valid=3560, output_file="cert.cert", L
         san_list.append(x509.IPAddress(ipaddress.IPv6Address("::1")))
 
         # append local v4 ip
-        mylocalipv4 = localipv4()
+        mylocalipv4 = local_ipv4()
         if mylocalipv4:
             san_list.append(x509.IPAddress(ipaddress.IPv4Address(str(mylocalipv4))))
     except:
@@ -75,8 +74,8 @@ def generate_local_cert(private_key, days_valid=3560, output_file="cert.cert", L
         .subject_name(subject)
         .issuer_name(issuer)
         .public_key(private_key.public_key())
-        .not_valid_before(datetime.datetime.utcnow())
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=days_valid))
+        .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+        .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days_valid))
         .serial_number(x509.random_serial_number())
         .add_extension(x509.SubjectAlternativeName(san_list), critical=True)
         .sign(private_key, hashes.SHA256(), default_backend())

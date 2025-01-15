@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -19,60 +19,79 @@
 sabnzbd.getipaddress
 """
 
-import socket
-import multiprocessing.pool
 import functools
-import urllib.request
+import logging
+import socket
+import time
 import urllib.error
+import urllib.request
+from typing import Callable, Optional
+
 import socks
 
 import sabnzbd
 import sabnzbd.cfg
 from sabnzbd.encoding import ubtou
+from sabnzbd.happyeyeballs import happyeyeballs, family_type
+from sabnzbd.constants import DEF_NETWORKING_SHORT_TIMEOUT
 
 
-def timeout(max_timeout):
+def timeout(max_timeout: int):
     """Timeout decorator, parameter in seconds."""
 
-    def timeout_decorator(item):
+    def timeout_decorator(item: Callable) -> Callable:
         """Wrap the original function."""
 
         @functools.wraps(item)
         def func_wrapper(*args, **kwargs):
             """Closure for function."""
-            with multiprocessing.pool.ThreadPool(processes=1) as pool:
-                async_result = pool.apply_async(item, args, kwargs)
-                # raises a TimeoutError if execution exceeds max_timeout
-                return async_result.get(max_timeout)
+            # Raises a TimeoutError if execution exceeds max_timeout
+            # Raises a RuntimeError is SABnzbd is already shutting down when called
+            try:
+                return sabnzbd.THREAD_POOL.submit(item, *args, **kwargs).result(max_timeout)
+            except (TimeoutError, RuntimeError):
+                return None
 
         return func_wrapper
 
     return timeout_decorator
 
 
-@timeout(3.0)
+@timeout(DEF_NETWORKING_SHORT_TIMEOUT)
 def addresslookup(myhost):
     return socket.getaddrinfo(myhost, 80)
 
 
-@timeout(3.0)
+@timeout(DEF_NETWORKING_SHORT_TIMEOUT)
 def addresslookup4(myhost):
     return socket.getaddrinfo(myhost, 80, socket.AF_INET)
 
 
-@timeout(3.0)
+@timeout(DEF_NETWORKING_SHORT_TIMEOUT)
 def addresslookup6(myhost):
     return socket.getaddrinfo(myhost, 80, socket.AF_INET6)
 
 
-def active_socks5_proxy():
+def active_socks5_proxy() -> Optional[str]:
     """Return the active proxy"""
     if socket.socket == socks.socksocket:
         return "%s:%s" % socks.socksocket.default_proxy[1:3]
     return None
 
 
-def localipv4():
+def dnslookup() -> bool:
+    """Perform a basic DNS lookup"""
+    start = time.time()
+    try:
+        addresslookup(sabnzbd.cfg.selftest_host())
+        result = True
+    except:
+        result = False
+    logging.debug("DNS Lookup = %s (in %.2f seconds)", result, time.time() - start)
+    return result
+
+
+def local_ipv4() -> Optional[str]:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s_ipv4:
             # Option: use 100.64.1.1 (IANA-Reserved IPv4 Prefix for Shared Address Space)
@@ -80,53 +99,67 @@ def localipv4():
             ipv4 = s_ipv4.getsockname()[0]
     except socket.error:
         ipv4 = None
+
+    logging.debug("Local IPv4 address = %s", ipv4)
     return ipv4
 
 
-def publicipv4():
-    """Because of dual IPv4/IPv6 clients, finding the
-    public ipv4 needs special attention, meaning forcing
-    IPv4 connections, and not allowing IPv6 connections
+def public_ip(family: int = socket.AF_UNSPEC) -> Optional[str]:
     """
-    public_ipv4 = None
+    Reports the client's public IP address (IPv4 or IPv6, if specified by family), as reported by selftest host
+    """
+    start = time.time()
+    if resolvehostaddress := happyeyeballs(
+        sabnzbd.cfg.selftest_host(),
+        port=443,
+        timeout=DEF_NETWORKING_SHORT_TIMEOUT,
+        family=family,
+    ):
+        resolvehostip = resolvehostaddress.ipaddress
+    else:
+        logging.debug("Error resolving my IP address: resolvehost not found")
+        return None
+
+    if sabnzbd.misc.is_ipv4_addr(resolvehostip):
+        resolveurl = f"http://{resolvehostip}/?ipv4test"
+    elif sabnzbd.misc.is_ipv6_addr(resolvehostip):
+        resolveurl = f"http://[{resolvehostip}]/?ipv6test"  # including square brackets
+    else:
+        logging.debug("Error resolving public IP address: no valid IPv4 or IPv6 address found")
+        return None
+
     try:
-        ipv4_found = False
-        # we only want IPv4 resolving, so socket.AF_INET:
-        result = addresslookup4(sabnzbd.cfg.selftest_host())
-    except (socket.error, multiprocessing.context.TimeoutError):
-        # something very bad: no urllib2, no resolving of selftest_host, no network at all
-        return public_ipv4
+        req = urllib.request.Request(resolveurl)
+        req.add_header("Host", sabnzbd.cfg.selftest_host())
+        req.add_header("User-Agent", "SABnzbd/%s" % sabnzbd.__version__)
+        with urllib.request.urlopen(req, timeout=DEF_NETWORKING_SHORT_TIMEOUT) as open_req:
+            client_ip = ubtou(open_req.read().strip())
 
-    # we got one or more IPv4 address(es), so let's connect to them
-    for item in result:
-        # get next IPv4 address of sabnzbd.cfg.selftest_host()
-        selftest_ipv4 = item[4][0]
-        try:
-            # put the selftest_host's IPv4 address into the URL
-            req = urllib.request.Request("http://" + selftest_ipv4 + "/")
-            # specify the User-Agent, because certain sites refuse connections with "python urllib2" as User-Agent:
-            req.add_header("User-Agent", "SABnzbd/%s" % sabnzbd.__version__)
-            # specify the Host, because we only provide the IPv4 address in the URL:
-            req.add_header("Host", sabnzbd.cfg.selftest_host())
-            # get the response, timeout 2 seconds, in case the website is not accessible
-            public_ipv4 = ubtou(urllib.request.urlopen(req, timeout=2).read())
-            # ... check the response is indeed an IPv4 address:
-            # if we got anything else than a plain IPv4 address, this will raise an exception
-            socket.inet_aton(public_ipv4)
-            # if we get here without exception, we're done:
-            ipv4_found = True
-            break
-        except (socket.error, urllib.error.URLError):
-            # the connect OR the inet_aton raised an exception, so:
-            # continue the for loop to try next server IPv4 address
-            pass
+        # Make sure it's a valid IPv4 or IPv6 address
+        if not sabnzbd.misc.is_ipv4_addr(client_ip) and not sabnzbd.misc.is_ipv6_addr(client_ip):
+            raise ValueError
+    except:
+        logging.debug(
+            "Failed to get public address from %s (%s)",
+            sabnzbd.cfg.selftest_host(),
+            family_type(family),
+            exc_info=True,
+        )
+        return None
 
-    if not ipv4_found:
-        public_ipv4 = None
-    return public_ipv4
+    # If text is updated, make sure to update log-anonymization
+    logging.debug("Public address %s = %s (in %.2f seconds)", family_type(family), client_ip, time.time() - start)
+    return client_ip
 
 
-def ipv6():
+def public_ipv4() -> Optional[str]:
+    return public_ip(family=socket.AF_INET)
+
+
+def local_ipv6() -> Optional[str]:
+    """
+    return IPv6 address on local LAN interface. So a first check if there is IPv6 connectivity
+    """
     try:
         with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s_ipv6:
             # IPv6 prefix for documentation purpose
@@ -134,4 +167,15 @@ def ipv6():
             ipv6_address = s_ipv6.getsockname()[0]
     except:
         ipv6_address = None
+
+    # If text is updated, make sure to update log-anonymization
+    logging.debug("Local IPv6 address = %s", ipv6_address)
     return ipv6_address
+
+
+def public_ipv6() -> Optional[str]:
+    if (local_address := local_ipv6()) and not sabnzbd.misc.ip_in_subnet(local_address, "fe80::/10"):
+        if public_address := public_ip(family=socket.AF_INET6):
+            return public_address
+        elif not sabnzbd.misc.is_lan_addr(local_address):
+            return local_address

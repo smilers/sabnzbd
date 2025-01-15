@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -114,13 +114,13 @@ class Scheduler:
                 action = sabnzbd.Downloader.pause
                 arguments = []
             elif action_name == "pause_all":
-                action = sabnzbd.pause_all
+                action = sabnzbd.downloader.pause_all
                 arguments = []
             elif action_name == "shutdown":
                 action = sabnzbd.shutdown_program
                 arguments = []
             elif action_name == "restart":
-                action = sabnzbd.restart_program
+                action = restart_program
                 arguments = []
             elif action_name == "pause_post":
                 action = pp_pause
@@ -129,14 +129,16 @@ class Scheduler:
             elif action_name == "speedlimit" and arguments != []:
                 action = sabnzbd.Downloader.limit_speed
             elif action_name == "enable_server" and arguments != []:
-                action = sabnzbd.enable_server
+                action = enable_server
             elif action_name == "disable_server" and arguments != []:
-                action = sabnzbd.disable_server
+                action = disable_server
             elif action_name == "scan_folder":
                 action = sabnzbd.DirScanner.scan
             elif action_name == "rss_scan":
                 action = sabnzbd.RSSReader.run
                 rss_planned = True
+            elif action_name == "create_backup":
+                action = sabnzbd.config.create_config_backup
             elif action_name == "remove_failed":
                 action = sabnzbd.api.history_remove_failed
             elif action_name == "remove_completed":
@@ -191,34 +193,53 @@ class Scheduler:
             self.scheduler.add_single_task(sabnzbd.RSSReader.run, "RSS", 15)
 
         if cfg.version_check():
-            # Check for new release, once per week on random time
+            # Check for new release daily at a random time
             m = random.randint(0, 59)
             h = random.randint(0, 23)
-            d = (random.randint(1, 7),)
 
-            logging.info("Scheduling VersionCheck on day %s at %s:%s", d[0], h, m)
-            self.scheduler.add_daytime_task(sabnzbd.misc.check_latest_version, "VerCheck", d, None, (h, m))
+            logging.info("Scheduling version check in 10 minutes and daily at %s:%s", h, m)
+            self.scheduler.add_single_task(sabnzbd.misc.check_latest_version, "version_check", 10 * 60)
+            self.scheduler.add_daytime_task(
+                sabnzbd.misc.check_latest_version,
+                "recurring_version_check",
+                DAILY_RANGE,
+                None,
+                (h, m),
+            )
 
         action, hour, minute = sabnzbd.BPSMeter.get_quota()
         if action:
             logging.info("Setting schedule for quota check daily at %s:%s", hour, minute)
             self.scheduler.add_daytime_task(action, "quota_reset", DAILY_RANGE, None, (hour, minute))
 
-        if sabnzbd.misc.int_conv(cfg.history_retention()) > 0:
-            logging.info("Setting schedule for midnight auto history-purge")
-            self.scheduler.add_daytime_task(
-                sabnzbd.database.midnight_history_purge, "midnight_history_purge", DAILY_RANGE, None, (0, 0)
-            )
-
-        logging.info("Setting schedule for midnight BPS reset")
-        self.scheduler.add_daytime_task(sabnzbd.BPSMeter.update, "midnight_bps", DAILY_RANGE, None, (0, 0))
-
-        logging.info("Setting schedule for server expiration check")
+        logging.info("Setting schedule for midnight auto history-purge")
         self.scheduler.add_daytime_task(
-            sabnzbd.downloader.check_server_expiration, "check_server_expiration", DAILY_RANGE, None, (0, 0)
+            sabnzbd.database.scheduled_history_purge,
+            "midnight_history_purge",
+            DAILY_RANGE,
+            None,
+            (0, 0),
         )
 
-        logging.info("Setting scheduler for server quota check")
+        logging.info("Setting schedule for midnight BPS reset")
+        self.scheduler.add_daytime_task(
+            sabnzbd.BPSMeter.update,
+            "midnight_bps",
+            DAILY_RANGE,
+            None,
+            (0, 0),
+        )
+
+        logging.info("Setting schedule for midnight server expiration check")
+        self.scheduler.add_daytime_task(
+            sabnzbd.downloader.check_server_expiration,
+            "check_server_expiration",
+            DAILY_RANGE,
+            None,
+            (0, 0),
+        )
+
+        logging.info("Setting schedule for server quota check")
         self.scheduler.add_interval_task(
             sabnzbd.downloader.check_server_quota,
             "check_server_quota",
@@ -311,9 +332,9 @@ class Scheduler:
         # Normal analysis
         if not was_paused:
             if paused_all:
-                sabnzbd.pause_all()
+                sabnzbd.downloader.pause_all()
             else:
-                sabnzbd.unpause_all()
+                sabnzbd.downloader.unpause_all()
             sabnzbd.Downloader.set_paused_state(paused or paused_all)
 
         sabnzbd.PostProcessor.paused = pause_post
@@ -340,7 +361,7 @@ class Scheduler:
     def scheduled_resume(self):
         """Scheduled resume, only when no oneshot resume is active"""
         if self.pause_end is None:
-            sabnzbd.unpause_all()
+            sabnzbd.downloader.unpause_all()
 
     def __oneshot_resume(self, when):
         """Called by delayed resume schedule
@@ -349,7 +370,7 @@ class Scheduler:
         if self.pause_end is not None and (when > self.pause_end - 5) and (when < self.pause_end + 55):
             self.pause_end = None
             logging.debug("Resume after pause-interval")
-            sabnzbd.unpause_all()
+            sabnzbd.downloader.unpause_all()
         else:
             logging.debug("Ignoring cancelled resume")
 
@@ -362,7 +383,7 @@ class Scheduler:
             sabnzbd.Downloader.pause()
         else:
             self.pause_end = None
-            sabnzbd.unpause_all()
+            sabnzbd.downloader.unpause_all()
 
     def __check_diskspace(self, full_dir: str, required_space: float):
         """Resume if there is sufficient available space"""
@@ -421,7 +442,7 @@ class Scheduler:
         if self.pause_end is not None and (self.pause_end - time.time()) < 0:
             self.pause_end = None
             logging.debug("Force resume, negative timer")
-            sabnzbd.unpause_all()
+            sabnzbd.downloader.unpause_all()
 
     def plan_server(self, action, parms, interval):
         """Plan to re-activate server after 'interval' minutes"""
@@ -430,14 +451,6 @@ class Scheduler:
     def force_rss(self):
         """Add a one-time RSS scan, one second from now"""
         self.scheduler.add_single_task(sabnzbd.RSSReader.run, "RSS", 1)
-
-
-def pp_pause():
-    sabnzbd.PostProcessor.paused = True
-
-
-def pp_resume():
-    sabnzbd.PostProcessor.paused = False
 
 
 def sort_schedules(all_events, now=None):
@@ -483,3 +496,41 @@ def sort_schedules(all_events, now=None):
 
     events.sort(key=lambda x: x[0])
     return events
+
+
+def pp_pause():
+    sabnzbd.PostProcessor.paused = True
+
+
+def pp_resume():
+    sabnzbd.PostProcessor.paused = False
+
+
+def enable_server(server):
+    """Enable server (scheduler only)"""
+    try:
+        config.get_config("servers", server).enable.set(1)
+    except:
+        logging.warning(T("Trying to set status of non-existing server %s"), server)
+        return
+    config.save_config()
+    sabnzbd.Downloader.update_server(server, server)
+
+
+def disable_server(server):
+    """Disable server (scheduler only)"""
+    try:
+        config.get_config("servers", server).enable.set(0)
+    except:
+        logging.warning(T("Trying to set status of non-existing server %s"), server)
+        return
+    config.save_config()
+    sabnzbd.Downloader.update_server(server, server)
+
+
+def restart_program():
+    """Restart program (used by scheduler)"""
+    logging.info("Scheduled restart request")
+    # Just set the stop flag, because stopping CherryPy from
+    # the scheduler is not reliable
+    sabnzbd.TRIGGER_RESTART = True

@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -35,6 +35,7 @@ from sabnzbd.utils.systrayiconthread import SysTrayIconThread
 
 
 class SABTrayThread(SysTrayIconThread):
+    # When updating these paths, also update them in the NSIS script!
     sabicons = {
         "default": "icons/sabnzbd16_32.ico",
         "green": "icons/sabnzbd16_32green.ico",
@@ -181,7 +182,7 @@ class SABTrayThread(SysTrayIconThread):
         sabnzbd.trigger_restart()
 
     def defhost(self, icon):
-        sabnzbd.cfg.cherryhost.set("127.0.0.1")
+        sabnzbd.cfg.web_host.set("127.0.0.1")
         sabnzbd.cfg.enable_https.set(False)
         sabnzbd.config.save_config()
         self.hover_text = T("Restart")
@@ -189,7 +190,7 @@ class SABTrayThread(SysTrayIconThread):
 
     def shutdown(self, icon):
         self.hover_text = T("Shutdown")
-        # In seperate thread, because the shutdown also stops the tray icon
+        # In separate thread, because the shutdown also stops the tray icon
         Thread(target=sabnzbd.shutdown_program).start()
 
     def pause(self):
@@ -198,4 +199,4 @@ class SABTrayThread(SysTrayIconThread):
 
     def resume(self):
         sabnzbd.Scheduler.plan_resume(0)
-        sabnzbd.unpause_all()
+        sabnzbd.downloader.unpause_all()

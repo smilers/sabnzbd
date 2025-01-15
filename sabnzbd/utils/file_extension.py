@@ -8,25 +8,32 @@ Note: extension always contains a leading dot
 import puremagic
 import os
 import sys
-from typing import List
+from typing import List, Tuple
 from sabnzbd.filesystem import get_ext, RAR_RE
+import sabnzbd.cfg as cfg
 
 # common extension from https://www.computerhope.com/issues/ch001789.htm
 POPULAR_EXT = (
     "3g2",
     "3gp",
     "7z",
+    "aac",
+    "abw",
     "ai",
     "aif",
     "apk",
+    "arc",
     "arj",
     "asp",
     "aspx",
     "avi",
+    "azw",
     "bak",
     "bat",
     "bin",
     "bmp",
+    "bz",
+    "bz2",
     "c",
     "cab",
     "cda",
@@ -34,13 +41,12 @@ POPULAR_EXT = (
     "cfg",
     "cfm",
     "cgi",
-    "cgi",
-    "cgi",
     "class",
     "com",
     "cpl",
     "cpp",
     "cs",
+    "csh",
     "css",
     "csv",
     "cur",
@@ -57,19 +63,22 @@ POPULAR_EXT = (
     "email",
     "eml",
     "emlx",
+    "eot",
+    "epub",
     "exe",
     "flv",
     "fnt",
     "fon",
     "gadget",
     "gif",
+    "gz",
     "h",
     "h264",
     "htm",
     "html",
     "icns",
     "ico",
-    "ico",
+    "ics",
     "ini",
     "iso",
     "jar",
@@ -77,6 +86,8 @@ POPULAR_EXT = (
     "jpeg",
     "jpg",
     "js",
+    "json",
+    "jsonld",
     "jsp",
     "key",
     "lnk",
@@ -85,6 +96,7 @@ POPULAR_EXT = (
     "mdb",
     "mid",
     "midi",
+    "mjs",
     "mkv",
     "mov",
     "mp3",
@@ -92,23 +104,24 @@ POPULAR_EXT = (
     "mpa",
     "mpeg",
     "mpg",
+    "mpkg",
     "msg",
-    "msi",
     "msi",
     "odp",
     "ods",
     "odt",
     "oft",
+    "oga",
     "ogg",
+    "ogv",
+    "ogx",
+    "opus",
     "ost",
     "otf",
     "part",
     "pdf",
     "php",
-    "php",
     "pkg",
-    "pl",
-    "pl",
     "pl",
     "png",
     "pps",
@@ -117,8 +130,6 @@ POPULAR_EXT = (
     "ps",
     "psd",
     "pst",
-    "py",
-    "py",
     "py",
     "rar",
     "rm",
@@ -133,22 +144,27 @@ POPULAR_EXT = (
     "swift",
     "sys",
     "tar",
-    "tar",
-    "gz",
     "tex",
     "tif",
     "tiff",
     "tmp",
     "toast",
+    "ts",
     "ttf",
     "txt",
     "vb",
     "vcd",
     "vcf",
     "vob",
+    "vsd",
     "wav",
+    "weba",
+    "webm",
+    "webp",
     "wma",
     "wmv",
+    "woff",
+    "woff2",
     "wpd",
     "wpl",
     "wsf",
@@ -156,6 +172,8 @@ POPULAR_EXT = (
     "xls",
     "xlsm",
     "xlsx",
+    "xml",
+    "xul",
     "z",
     "zip",
 )
@@ -163,6 +181,7 @@ POPULAR_EXT = (
 DOWNLOAD_EXT = (
     "ass",
     "avi",
+    "azw3",
     "bat",
     "bdmv",
     "bin",
@@ -196,11 +215,12 @@ DOWNLOAD_EXT = (
     "m2ts",
     "m3u",
     "m4a",
+    "m4b",
     "mkv",
+    "mobi",
     "mp3",
     "mp4",
     "mpls",
-    "mx",
     "nfo",
     "nib",
     "nzb",
@@ -209,7 +229,6 @@ DOWNLOAD_EXT = (
     "part",
     "pdf",
     "pem",
-    "php",
     "plist",
     "png",
     "py",
@@ -221,6 +240,7 @@ DOWNLOAD_EXT = (
     "srr",
     "srs",
     "srt",
+    "ssa",
     "strings",
     "sub",
     "sup",
@@ -230,21 +250,26 @@ DOWNLOAD_EXT = (
     "txt",
     "url",
     "vob",
-    "website",
     "wmv",
     "xpi",
 )
 
 # Combine to one tuple, with unique entries:
 ALL_EXT = tuple(set(POPULAR_EXT + DOWNLOAD_EXT))
-# Prepend a dot to each extension, because we work with a leading dot in extensions
+# ... and prepend a dot to each extension, because we work with a leading dot in extensions
 ALL_EXT = tuple(["." + i for i in ALL_EXT])
+
+
+def all_extensions() -> Tuple[str, ...]:
+    """returns tuple with ALL (standard + userdef) extensions (including leading dot in extension)"""
+    user_defined_extensions = tuple(["." + i for i in cfg.ext_rename_ignore()])
+    return ALL_EXT + user_defined_extensions
 
 
 def has_popular_extension(file_path: str) -> bool:
     """returns boolean if the extension of file_path is a popular, well-known extension"""
     file_extension = get_ext(file_path)
-    return file_extension in ALL_EXT or RAR_RE.match(file_extension)
+    return file_extension in all_extensions() or RAR_RE.match(file_extension)
 
 
 def all_possible_extensions(file_path: str) -> List[str]:
@@ -257,18 +282,12 @@ def all_possible_extensions(file_path: str) -> List[str]:
 
 def what_is_most_likely_extension(file_path: str) -> str:
     """Returns most_likely extension, with a leading dot"""
-    for possible_extension in all_possible_extensions(file_path):
-        # let's see if technically-suggested extension by puremagic is also likely IRL
-        if possible_extension in ALL_EXT:
-            # Yes, looks likely
-            return possible_extension
 
-    # Check if text or NZB, as puremagic is not good at that.
+    # First: Check if text or NZB, as puremagic is not good at that.
     try:
         # Only read the start, don't need the whole file
         with open(file_path, "r") as inp_file:
             txt = inp_file.read(200).lower()
-
         # Yes, a text file ... so let's check if it's even an NZB:
         if "!doctype nzb public" in txt or "<nzb xmlns=" in txt:
             # yes, contains NZB signals:
@@ -276,8 +295,15 @@ def what_is_most_likely_extension(file_path: str) -> str:
         else:
             return ".txt"
     except UnicodeDecodeError:
-        # not txt (and not nzb)
+        # not txt (and thus not nzb)
         pass
+
+    all_exts = all_extensions()
+    for possible_extension in all_possible_extensions(file_path):
+        # let's see if technically-suggested extension by puremagic is also likely IRL
+        if possible_extension in all_exts:
+            # Yes, looks likely
+            return possible_extension
 
     # no popular extension found, so just trust puremagic and return the first extension (if any)
     try:

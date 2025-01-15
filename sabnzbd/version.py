@@ -4,6 +4,7 @@
 # (e.g. "develop" or "1.2.x")
 
 # You MUST use double quotes (so " and not ')
+# Do not forget to update the appdata file for every major release!
 
-__version__ = "develop"
+__version__ = "4.5.0Beta1"
 __baseline__ = "unknown"

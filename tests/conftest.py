@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -27,6 +27,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from warnings import warn
 
+from sabnzbd.constants import DEF_INI_FILE
 from tests.testhelper import *
 
 
@@ -46,6 +47,7 @@ def clean_cache_dir(request):
     # Remove cache dir with retries in case it's still running
     for x in range(10):
         try:
+            time.sleep(1)
             shutil.rmtree(SAB_CACHE_DIR)
             break
         except OSError:
@@ -54,7 +56,7 @@ def clean_cache_dir(request):
 
 
 @pytest.fixture(scope="module")
-def run_sabnzbd(clean_cache_dir):
+def run_sabnzbd(clean_cache_dir, request):
     """Start SABnzbd (with translations). A number of key configuration parameters are defined
     in testhelper.py (SAB_* variables). Scope is set to 'module' to prevent configuration
     changes made during functional tests from causing failures in unrelated tests."""
@@ -65,12 +67,15 @@ def run_sabnzbd(clean_cache_dir):
             get_url_result("shutdown", SAB_HOST, SAB_PORT)
         except requests.ConnectionError:
             sabnzbd_process.kill()
-            sabnzbd_process.communicate(timeout=10)
-        except Exception:
-            warn("Failed to shutdown the sabnzbd process")
+            sabnzbd_process.communicate(timeout=30)
+        except Exception as err:
+            warn("Failed to shutdown the sabnzbd process: %s" % err)
+
+    # Allow the test file to specify what ini to load; if none given, use the basic one by default
+    ini_file = getattr(request.module, "INI_FILE", "sabnzbd.basic.ini")
 
     # Copy basic config file with API key
-    shutil.copyfile(os.path.join(SAB_DATA_DIR, "sabnzbd.basic.ini"), os.path.join(SAB_CACHE_DIR, "sabnzbd.ini"))
+    shutil.copyfile(os.path.join(SAB_DATA_DIR, ini_file), os.path.join(SAB_CACHE_DIR, DEF_INI_FILE))
 
     # Check if we have language files
     locale_dir = os.path.join(SAB_BASE_DIR, "..", "locale")
@@ -104,7 +109,7 @@ def run_sabnzbd(clean_cache_dir):
     )
 
     # Wait for SAB to respond
-    for _ in range(10):
+    for _ in range(30):
         try:
             get_url_result()
             # Woohoo, we're up!
@@ -129,6 +134,7 @@ def run_sabnews_and_selenium(request):
 
     # Headless during CI testing
     if "CI" in os.environ:
+        driver_options.browser_version = "127"
         driver_options.add_argument("--headless")
         driver_options.add_argument("--no-sandbox")
 
@@ -138,9 +144,7 @@ def run_sabnews_and_selenium(request):
 
     # Start the driver and pass it on to all the classes
     driver = webdriver.Chrome(options=driver_options)
-    for item in request.node.items:
-        parent_class = item.getparent(pytest.Class)
-        parent_class.obj.driver = driver
+    SABnzbdBaseTest.driver = driver
 
     # Start SABNews
     sabnews_process = subprocess.Popen([sys.executable, os.path.join(SAB_BASE_DIR, "sabnews.py")])
@@ -152,16 +156,16 @@ def run_sabnews_and_selenium(request):
     try:
         sabnews_process.kill()
         sabnews_process.communicate(timeout=10)
-    except:
-        warn("Failed to shutdown the sabnews process")
+    except Exception as err:
+        warn("Failed to shutdown the sabnews process: %s" % err)
 
     # Shutdown Selenium/Chrome
     try:
         driver.close()
         driver.quit()
-    except:
+    except Exception as err:
         # If something else fails, this can cause very non-informative long tracebacks
-        warn("Failed to shutdown the selenium/chromedriver process")
+        warn("Failed to shutdown the selenium/chromedriver process: %s" % err)
 
 
 @pytest.fixture(scope="class")

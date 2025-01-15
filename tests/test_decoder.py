@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -29,12 +29,23 @@ import sabnzbd.decoder as decoder
 from sabnzbd.nzbstuff import Article
 
 
+def uu(data: bytes):
+    """Uuencode data and insert a period if necessary"""
+    line = binascii.b2a_uu(data).rstrip(b"\n")
+
+    # Dot stuffing
+    if line.startswith(b"."):
+        return b"." + line
+
+    return line
+
+
 LINES_DATA = [os.urandom(45) for _ in range(32)]
-VALID_UU_LINES = [binascii.b2a_uu(data).rstrip(b"\n") for data in LINES_DATA]
+VALID_UU_LINES = [uu(data) for data in LINES_DATA]
 
 END_DATA = os.urandom(randint(1, 45))
 VALID_UU_END = [
-    binascii.b2a_uu(END_DATA).rstrip(b"\n"),
+    uu(END_DATA),
     b"`",
     b"end",
 ]
@@ -48,6 +59,7 @@ class TestUuDecoder:
         insert_excess_empty_lines: bool = False,
         insert_headers: bool = False,
         insert_end: bool = True,
+        insert_dot_stuffing_line: bool = False,
         begin_line: bytes = b"begin 644 My Favorite Open Source Movie.mkv",
     ):
         """Generate message parts. Part may be one of 'begin', 'middle', or 'end' for multipart
@@ -89,6 +101,10 @@ class TestUuDecoder:
             data.extend(VALID_UU_LINES[:size])
             result.extend(LINES_DATA[:size])
 
+            if insert_dot_stuffing_line:
+                data.append(uu(b"\0" * 14))
+                result.append(b"\0" * 14)
+
         if part in ("end", "single"):
             if insert_end:
                 data.extend(VALID_UU_END)
@@ -102,7 +118,7 @@ class TestUuDecoder:
         # Concatenate expected result
         result = b"".join(result)
 
-        return article, data, result
+        return article, bytearray(data), result
 
     def test_no_data(self):
         with pytest.raises(decoder.BadUu):
@@ -111,28 +127,28 @@ class TestUuDecoder:
     @pytest.mark.parametrize(
         "raw_data",
         [
-            [b""],
-            [b"\r\n\r\n"],
-            [b"f", b"o", b"o", b"b", b"a", b"r", b"\r\n"],  # Plenty of list items, but (too) few actual lines
-            [b"222 0 <artid@woteva>\r\nX-Too-Short: yup\r\n"],
+            b"",
+            b"\r\n\r\n",
+            b"foobar\r\n",  # Plenty of list items, but (too) few actual lines
+            b"222 0 <artid@woteva>\r\nX-Too-Short: yup\r\n",
         ],
     )
     def test_short_data(self, raw_data):
         with pytest.raises(decoder.BadUu):
-            assert decoder.decode_uu(None, raw_data)
+            assert decoder.decode_uu(None, bytearray(raw_data))
 
     @pytest.mark.parametrize(
         "raw_data",
         [
-            [b"222 0 <foo@bar>\r\n\r\n"],  # Missing altogether
-            [b"222 0 <foo@bar>\r\n\r\nbeing\r\n"],  # Typo in 'begin'
-            [b"222 0 <foo@bar>\r\n\r\nx-header: begin 644 foobar\r\n"],  # Not at start of the line
-            [b"666 0 <foo@bar>\r\nbegin\r\n"],  # No empty line + wrong response code
-            [b"OMG 0 <foo@bar>\r\nbegin\r\n"],  # No empty line + invalid response code
-            [b"222 0 <foo@bar>\r\nbegin\r\n"],  # No perms
-            [b"222 0 <foo@bar>\r\nbegin ABC DEF\r\n"],  # Permissions not octal
-            [b"222 0 <foo@bar>\r\nbegin 755\r\n"],  # No filename
-            [b"222 0 <foo@bar>\r\nbegin 644 \t \t\r\n"],  # Filename empty after stripping
+            b"222 0 <foo@bar>\r\n\r\n",  # Missing altogether
+            b"222 0 <foo@bar>\r\n\r\nbeing\r\n",  # Typo in 'begin'
+            b"222 0 <foo@bar>\r\n\r\nx-header: begin 644 foobar\r\n",  # Not at start of the line
+            b"666 0 <foo@bar>\r\nbegin\r\n",  # No empty line + wrong response code
+            b"OMG 0 <foo@bar>\r\nbegin\r\n",  # No empty line + invalid response code
+            b"222 0 <foo@bar>\r\nbegin\r\n",  # No perms
+            b"222 0 <foo@bar>\r\nbegin ABC DEF\r\n",  # Permissions not octal
+            b"222 0 <foo@bar>\r\nbegin 755\r\n",  # No filename
+            b"222 0 <foo@bar>\r\nbegin 644 \t \t\r\n",  # Filename empty after stripping
         ],
     )
     def test_missing_uu_begin(self, raw_data):
@@ -140,12 +156,15 @@ class TestUuDecoder:
         article.lowest_partnum = True
         filler = b"\r\n" * 4
         with pytest.raises(decoder.BadUu):
-            assert decoder.decode_uu(article, raw_data.append(filler))
+            raw_data = bytearray(raw_data)
+            raw_data.extend(filler)
+            assert decoder.decode_uu(article, raw_data)
 
     @pytest.mark.parametrize("insert_empty_line", [True, False])
     @pytest.mark.parametrize("insert_excess_empty_lines", [True, False])
     @pytest.mark.parametrize("insert_headers", [True, False])
     @pytest.mark.parametrize("insert_end", [True, False])
+    @pytest.mark.parametrize("insert_dot_stuffing_line", [True, False])
     @pytest.mark.parametrize(
         "begin_line",
         [
@@ -155,13 +174,27 @@ class TestUuDecoder:
             b"begin 0755 shell.sh",
         ],
     )
-    def test_singlepart(self, insert_empty_line, insert_excess_empty_lines, insert_headers, insert_end, begin_line):
+    def test_singlepart(
+        self,
+        insert_empty_line,
+        insert_excess_empty_lines,
+        insert_headers,
+        insert_end,
+        insert_dot_stuffing_line,
+        begin_line,
+    ):
         """Test variations of a sane single part nzf with proper uu-encoded data"""
         # Generate a singlepart message
         article, raw_data, expected_result = self._generate_msg_part(
-            "single", insert_empty_line, insert_excess_empty_lines, insert_headers, insert_end, begin_line
+            "single",
+            insert_empty_line,
+            insert_excess_empty_lines,
+            insert_headers,
+            insert_end,
+            insert_dot_stuffing_line,
+            begin_line,
         )
-        assert decoder.decode_uu(article, [raw_data]) == expected_result
+        assert decoder.decode_uu(article, raw_data) == expected_result
         assert article.nzf.filename_checked
 
     @pytest.mark.parametrize("insert_empty_line", [True, False])
@@ -172,7 +205,7 @@ class TestUuDecoder:
         decoded_data = expected_data = b""
         for part in ("begin", "middle", "middle", "end"):
             article, data, result = self._generate_msg_part(part, insert_empty_line, False, False, True)
-            decoded_data += decoder.decode_uu(article, [data])
+            decoded_data += decoder.decode_uu(article, data)
             expected_data += result
 
         # Verify results
@@ -182,7 +215,6 @@ class TestUuDecoder:
     @pytest.mark.parametrize(
         "bad_data",
         [
-            b"MI^+0E\"C^364:CQ':]DW++^$F0J)6FDG/!`]0\\(4;EG$UY5RI,3JMBNX\\8+06\r\n$(WAIVBC^",  # Trailing junk
             VALID_UU_LINES[-1][:10] + bytes("ваше здоровье", encoding="utf8") + VALID_UU_LINES[-1][-10:],  # Non-ascii
         ],
     )
@@ -191,4 +223,4 @@ class TestUuDecoder:
         article.lowest_partnum = False
         filler = b"\r\n".join(VALID_UU_LINES[:4]) + b"\r\n"
         with pytest.raises(decoder.BadData):
-            assert decoder.decode_uu(article, [b"222 0 <foo@bar>\r\n" + filler + bad_data + b"\r\n"])
+            assert decoder.decode_uu(article, bytearray(b"222 0 <foo@bar>\r\n" + filler + bad_data + b"\r\n"))

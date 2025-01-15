@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -36,9 +36,7 @@ class TestCertGen:
         private_key = generate_key(output_file=os.path.join(SAB_CACHE_DIR, "test_key.pem"))
         assert private_key.key_size == 2048
 
-    @pytest.mark.parametrize(
-        "key_size, file_name", [(512, "test_key.pem"), (1024, "test_123_key.pem"), (4096, "123_key.pem")]
-    )
+    @pytest.mark.parametrize("key_size, file_name", [(1024, "test_123_key.pem"), (4096, "123_key.pem")])
     def test_generate_key_custom(self, key_size, file_name):
         # Generate private key
         private_key = generate_key(key_size=key_size, output_file=os.path.join(SAB_CACHE_DIR, file_name))
@@ -66,4 +64,4 @@ class TestCertGen:
             cert = x509.load_pem_x509_certificate(cert_content, default_backend())
 
             # Validate that the timestamp at which the certificate stops being valid (expiration date) is in future
-            assert datetime.datetime.now() < cert.not_valid_after
+            assert datetime.datetime.now(datetime.timezone.utc) < cert.not_valid_after_utc

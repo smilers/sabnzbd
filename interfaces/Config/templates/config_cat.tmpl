@@ -1,15 +1,16 @@
 <!--#set global $pane="Categories"#-->
-<!--#set global $help_uri="configuration/3.5/categories"#-->
+<!--#set global $help_uri = $confighelpuri + "categories"#-->
 <!--#include $webdir + "/_inc_header_uc.tmpl"#-->
 <div class="colmask">
     <div class="section">
-        <div class="padTable"> <a class="main-helplink" href="$helpuri$help_uri" target="_blank"><span class="glyphicon glyphicon-question-sign"></span></a>
+        <div class="padTable">
+            <a class="main-helplink" href="$help_uri" target="_blank"><span class="glyphicon glyphicon-question-sign"></span></a>
             <p>$T('explain-catTags2')<br/>$T('explain-catTags')</p>
             <hr>
             <h5 class="darkred"><strong>$T('explain-relFolder'):</strong> <span class="path">$defdir</span></h5>
             <!--#for $cur, $slot in enumerate($slotinfo)#-->
                 <!--#set $cansort = $slot.name != '*' and $slot.name != ''#-->
-                <form action="save" method="get" <!--#if $cansort#-->class="sorting-row"<!--#end if#-->>
+                <form action="save" method="post" <!--#if $cansort#-->class="sorting-row"<!--#end if#-->>
                     <table class="catTable">
                         <!--#if $cur == 0#-->
                         <tr>
@@ -104,29 +105,29 @@
 </div>
 <script type="text/javascript" src="${root}staticcfg/js/jquery-ui.min.js"></script>
 <script type="text/javascript">
-    \$(document).ready(function() {
-        \$('.delCat').click(function() {
-            var theForm = \$(this).closest("form");
+    jQuery(document).ready(function() {
+        jQuery('.delCat').click(function() {
+            var theForm = jQuery(this).closest("form");
             theForm.attr("action", "delete").submit();
         });
 
         // Add autocomplete and file-browser
-        \$('.fileBrowserSmall').typeahead().fileBrowser();
+        jQuery('.fileBrowserSmall').typeahead({appendTo: 'body'}).fileBrowser();
 
         // Make categories sortable
-        \$('.padTable').sortable({
+        jQuery('.padTable').sortable({
             items: '.sorting-row',
             containment: '.colmask',
             axis: 'y',
             update: function(event, ui) {
-                \$('.Categories form.sorting-row').each(function(index, elm) {
+                jQuery('.Categories form.sorting-row').each(function(index, elm) {
                     // Update order of all elements
-                    if(index != elm.order.value) {
+                    if(index !== elm.order.value) {
                         elm.order.value = index
                         // Submit changed order
                         var data = {}
-                        \$(elm).extractFormDataTo(data);
-                        \$.ajax({
+                        jQuery(elm).extractFormDataTo(data);
+                        jQuery.ajax({
                             type: "GET",
                             url: window.location.pathname + 'save',
                             data: data,

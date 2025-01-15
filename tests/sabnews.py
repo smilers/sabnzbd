@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -31,7 +31,7 @@ import time
 
 from random import randint
 
-import sabyenc3
+import sabctools
 
 logging.getLogger().setLevel(logging.INFO)
 
@@ -115,7 +115,7 @@ class NewsServerProtocol(asyncio.Protocol):
             inp_buffer = inp_file.read(size)
 
         # Encode data
-        output_string, crc = sabyenc3.encode(inp_buffer)
+        output_string, crc = sabctools.yenc_encode(inp_buffer)
         self.transport.write(output_string)
 
         # Write footer
@@ -132,10 +132,10 @@ async def serve_sabnews(hostname, port):
     # Start server
     logging.info("Starting SABNews on %s:%d", hostname, port)
 
-    # Needed for Python 3.5 support!
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     server = await loop.create_server(lambda: NewsServerProtocol(), hostname, port)
-    return server
+    async with server:
+        await server.serve_forever()
 
 
 def create_nzb(nzb_file=None, nzb_dir=None, metadata=None):
@@ -145,6 +145,7 @@ def create_nzb(nzb_file=None, nzb_dir=None, metadata=None):
 
     # Either use directory or single file
     if nzb_dir:
+        nzb_dir = os.path.normpath(nzb_dir)
         if not os.path.exists(nzb_dir) or not os.path.isdir(nzb_dir):
             raise NotADirectoryError("%s is not a valid directory" % nzb_dir)
 
@@ -208,9 +209,7 @@ def main():
 
     # Serve if we are not creating NZB's
     if not args.nzb_file and not args.nzb_dir:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(serve_sabnews(args.hostname, args.port))
-        loop.run_forever()
+        asyncio.run(serve_sabnews(args.hostname, args.port))
     else:
         create_nzb(args.nzb_file, args.nzb_dir)
 

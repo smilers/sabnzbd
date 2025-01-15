@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -OO
-# Copyright 2007-2021 The SABnzbd-Team <team@sabnzbd.org>
+# Copyright 2007-2024 by The SABnzbd-Team (sabnzbd.org)
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -37,34 +37,13 @@ class TestApiInternals:
             api.api_handler("")
 
     def test_mode_invalid(self):
-        expected_error = "error: not implemented"
-        assert api.api_handler({"mode": "invalid"}).strip() == expected_error
-        with pytest.raises(IndexError):
-            assert api.api_handler({"mode": []}).strip() == expected_error
-            assert api.api_handler({"mode": ""}).strip() == expected_error
-            assert api.api_handler({"mode": None}).strip() == expected_error
+        assert "not implemented" in str(api.api_handler({"mode": "invalid"}))
 
     def test_version(self):
-        assert api.api_handler({"mode": "version"}).strip() == sabnzbd.__version__
+        assert sabnzbd.__version__ in str(api.api_handler({"mode": "version"}))
 
     def test_auth(self):
-        assert api.api_handler({"mode": "auth"}).strip() == "apikey"
-
-    @set_config({"disable_key": True, "username": "foo", "password": "bar"})
-    def test_auth_apikey_disabled(self):
-        assert api.api_handler({"mode": "auth"}).strip() == "login"
-
-    @set_config({"disable_key": True})
-    def test_auth_unavailable(self):
-        assert api.api_handler({"mode": "auth"}).strip() == "None"
-
-    @set_config({"disable_key": True, "username": "foo", "password": ""})
-    def test_auth_unavailable_username_set(self):
-        assert api.api_handler({"mode": "auth"}).strip() == "None"
-
-    @set_config({"disable_key": True, "username": "", "password": "bar"})
-    def test_auth_unavailable_password_set(self):
-        assert api.api_handler({"mode": "auth"}).strip() == "None"
+        assert "apikey" in str(api.api_handler({"mode": "auth"}))
 
 
 def set_remote_host_or_ip(hostname: str = "localhost", remote_ip: str = "127.0.0.1"):
@@ -78,11 +57,16 @@ class TestSecuredExpose:
 
     main_page = sabnzbd.interface.MainPage()
 
+    def api_wrapper(self, *args, **kwargs):
+        """Wrapper to convert bytes to str"""
+        if api_response := self.main_page.api(*args, **kwargs):
+            return str(api_response)
+
     def check_full_access(self, redirect_match: str = r".*wizard.*"):
         """Basic test if we have full access to API and interface"""
-        assert sabnzbd.__version__ in self.main_page.api(mode="version")
+        assert sabnzbd.__version__ in self.api_wrapper(mode="version")
         # Passed authentication
-        assert api._MSG_NOT_IMPLEMENTED in self.main_page.api(apikey=sabnzbd.cfg.api_key())
+        assert api._MSG_NOT_IMPLEMENTED in self.api_wrapper(apikey=sabnzbd.cfg.api_key())
         # Raises a redirect to the wizard
         with pytest.raises(cherrypy._cperror.HTTPRedirect, match=redirect_match):
             self.main_page.index()
@@ -94,44 +78,29 @@ class TestSecuredExpose:
     def test_api_no_or_wrong_api_key(self):
         set_remote_host_or_ip()
         # Get blocked
-        assert interface._MSG_APIKEY_REQUIRED in self.main_page.api()
-        assert interface._MSG_APIKEY_REQUIRED in self.main_page.api(mode="queue")
+        assert interface._MSG_APIKEY_REQUIRED in self.api_wrapper()
+        assert interface._MSG_APIKEY_REQUIRED in self.api_wrapper(mode="queue")
         # Allowed to access "auth" and "version" without key
-        assert "apikey" in self.main_page.api(mode="auth")
-        assert sabnzbd.__version__ in self.main_page.api(mode="version")
+        assert "apikey" in self.api_wrapper(mode="auth")
+        assert sabnzbd.__version__ in self.api_wrapper(mode="version")
         # Blocked when you do something wrong
-        assert interface._MSG_APIKEY_INCORRECT in self.main_page.api(mode="queue", apikey="wrong")
-
-    @set_config({"disable_key": True})
-    def test_api_disabled_key(self):
-        set_remote_host_or_ip()
-        assert api._MSG_NOT_IMPLEMENTED in self.main_page.api()
-
-    @set_config({"disable_key": True, "username": "foo", "password": "bar"})
-    def test_api_disabled_key_with_auth(self):
-        set_remote_host_or_ip()
-        assert interface._MSG_MISSING_AUTH in self.main_page.api()
-        assert interface._MSG_MISSING_AUTH in self.main_page.api(ma_username="foo")
-        assert interface._MSG_MISSING_AUTH in self.main_page.api(ma_password="bar")
-        assert interface._MSG_MISSING_AUTH in self.main_page.api(ma_username="wrong")
-        assert interface._MSG_MISSING_AUTH in self.main_page.api(ma_password="wrong")
-        assert api._MSG_NOT_IMPLEMENTED in self.main_page.api(ma_username="foo", ma_password="bar")
+        assert interface._MSG_APIKEY_INCORRECT in self.api_wrapper(mode="queue", apikey="wrong")
 
     def test_api_nzb_key(self):
         set_remote_host_or_ip()
         # It should only access the nzb-functions, nothing else
-        assert api._MSG_NO_VALUE in self.main_page.api(mode="addfile", apikey=sabnzbd.cfg.nzb_key())
-        assert interface._MSG_APIKEY_INCORRECT in self.main_page.api(mode="set_config", apikey=sabnzbd.cfg.nzb_key())
+        assert api._MSG_NO_VALUE in self.api_wrapper(mode="addfile", apikey=sabnzbd.cfg.nzb_key())
+        assert interface._MSG_APIKEY_INCORRECT in self.api_wrapper(mode="set_config", apikey=sabnzbd.cfg.nzb_key())
         assert interface._MSG_APIKEY_INCORRECT in self.main_page.shutdown(apikey=sabnzbd.cfg.nzb_key())
 
     def test_check_hostname_basic(self):
         # Block bad host
         set_remote_host_or_ip(hostname="not_me")
-        assert interface._MSG_ACCESS_DENIED_HOSTNAME in self.main_page.api()
+        assert interface._MSG_ACCESS_DENIED_HOSTNAME in self.api_wrapper()
         assert interface._MSG_ACCESS_DENIED_HOSTNAME in self.main_page.index()
         # Block empty value
         set_remote_host_or_ip(hostname="")
-        assert interface._MSG_ACCESS_DENIED_HOSTNAME in self.main_page.api()
+        assert interface._MSG_ACCESS_DENIED_HOSTNAME in self.api_wrapper()
         assert interface._MSG_ACCESS_DENIED_HOSTNAME in self.main_page.index()
 
         # Fine if ip-address
@@ -176,22 +145,22 @@ class TestSecuredExpose:
         """Each should allow all previous ones and the current one"""
         # Level 1: nzb
         if inet_exposure >= 1:
-            assert api._MSG_NO_VALUE in self.main_page.api(mode="addfile", apikey=sabnzbd.cfg.nzb_key())
-            assert api._MSG_NO_VALUE in self.main_page.api(mode="addfile", apikey=sabnzbd.cfg.api_key())
+            assert api._MSG_NO_VALUE in self.api_wrapper(mode="addfile", apikey=sabnzbd.cfg.nzb_key())
+            assert api._MSG_NO_VALUE in self.api_wrapper(mode="addfile", apikey=sabnzbd.cfg.api_key())
 
         # Level 2: basic API
         if inet_exposure >= 2:
-            assert api._MSG_NO_VALUE in self.main_page.api(mode="get_files", apikey=sabnzbd.cfg.api_key())
-            assert api._MSG_NO_VALUE in self.main_page.api(mode="change_script", apikey=sabnzbd.cfg.api_key())
+            assert api._MSG_NO_VALUE in self.api_wrapper(mode="get_files", apikey=sabnzbd.cfg.api_key())
+            assert api._MSG_NO_VALUE in self.api_wrapper(mode="change_script", apikey=sabnzbd.cfg.api_key())
             # Sub-function
-            assert "status" in self.main_page.api(mode="queue", name="resume", apikey=sabnzbd.cfg.api_key())
+            assert "status" in self.api_wrapper(mode="queue", name="resume", apikey=sabnzbd.cfg.api_key())
 
         # Level 3: full API
         if inet_exposure >= 3:
-            assert "misc" in self.main_page.api(mode="get_config", apikey=sabnzbd.cfg.api_key())
+            assert "misc" in self.api_wrapper(mode="get_config", apikey=sabnzbd.cfg.api_key())
             # Sub-function
-            assert api._MSG_NO_VALUE in self.main_page.api(
-                mode="config", name="set_colorscheme", apikey=sabnzbd.cfg.api_key()
+            assert "The hostname is not set" in self.api_wrapper(
+                mode="config", name="test_server", apikey=sabnzbd.cfg.api_key()
             )
 
         # Level 4: full interface
@@ -207,23 +176,23 @@ class TestSecuredExpose:
 
         # Level 2: basic API
         if inet_exposure <= 2:
-            assert interface._MSG_ACCESS_DENIED in self.main_page.api(mode="get_config", apikey=sabnzbd.cfg.api_key())
-            assert interface._MSG_ACCESS_DENIED in self.main_page.api(
-                mode="config", name="set_colorscheme", apikey=sabnzbd.cfg.api_key()
+            assert interface._MSG_ACCESS_DENIED in self.api_wrapper(mode="get_config", apikey=sabnzbd.cfg.api_key())
+            assert interface._MSG_ACCESS_DENIED in self.api_wrapper(
+                mode="config", name="set_nzbkey", apikey=sabnzbd.cfg.api_key()
             )
         # Level 1: nzb
         if inet_exposure <= 1:
-            assert interface._MSG_ACCESS_DENIED in self.main_page.api(mode="rescan", apikey=sabnzbd.cfg.api_key())
-            assert interface._MSG_ACCESS_DENIED in self.main_page.api(
+            assert interface._MSG_ACCESS_DENIED in self.api_wrapper(mode="get_scripts", apikey=sabnzbd.cfg.api_key())
+            assert interface._MSG_ACCESS_DENIED in self.api_wrapper(
                 mode="queue", name="resume", apikey=sabnzbd.cfg.api_key()
             )
 
         # Level 0: nothing, already checked above, but just to be sure
         if inet_exposure <= 0:
-            assert interface._MSG_ACCESS_DENIED in self.main_page.api(mode="addfile", apikey=sabnzbd.cfg.api_key())
+            assert interface._MSG_ACCESS_DENIED in self.api_wrapper(mode="addfile", apikey=sabnzbd.cfg.api_key())
             # Check with or without API-key
-            assert interface._MSG_ACCESS_DENIED in self.main_page.api(mode="auth", apikey=sabnzbd.cfg.api_key())
-            assert interface._MSG_ACCESS_DENIED in self.main_page.api(mode="auth")
+            assert interface._MSG_ACCESS_DENIED in self.api_wrapper(mode="auth", apikey=sabnzbd.cfg.api_key())
+            assert interface._MSG_ACCESS_DENIED in self.api_wrapper(mode="auth")
 
     def test_inet_exposure(self):
         # Run all tests as external user
@@ -237,7 +206,7 @@ class TestSecuredExpose:
             self.check_inet_blocks(inet_exposure=inet_exposure)
 
         # Reset it
-        sabnzbd.cfg.inet_exposure.set(sabnzbd.cfg.inet_exposure.default())
+        sabnzbd.cfg.inet_exposure.set(sabnzbd.cfg.inet_exposure.default)
 
     @set_config({"inet_exposure": 5, "username": "foo", "password": "bar"})
     def test_inet_exposure_login_for_external(self):
@@ -248,3 +217,45 @@ class TestSecuredExpose:
         # Remote user: redirect to login
         set_remote_host_or_ip(hostname="100.100.100.100", remote_ip="11.11.11.11")
         self.check_full_access(redirect_match=r".*login.*")
+
+    @set_config({"api_warnings": False})
+    def test_no_text_warnings(self):
+        assert self.main_page.index() is None
+        assert cherrypy.response.status == 403
+        assert self.api_wrapper(mode="queue") is None
+        assert cherrypy.response.status == 403
+        set_remote_host_or_ip(hostname="not_me")
+        assert self.api_wrapper() is None
+        assert cherrypy.response.status == 403
+
+
+class TestHistory:
+    @pytest.mark.usefixtures("run_sabnzbd")
+    def test_add_active_history_consistency(self):
+        """Verify that add_active_history has the same structure as fetch_history"""
+        history_db = os.path.join(SAB_CACHE_DIR, DEF_ADMIN_DIR, DB_HISTORY_NAME)
+        with FakeHistoryDB(history_db) as fake_history:
+            fake_history.add_fake_history_jobs(1)
+            jobs, total_items = fake_history.fetch_history()
+            history_job = jobs[-1]
+
+            # Add minimal attributes to create pp-job
+            nzo = mock.Mock()
+            nzo.final_name = "test_add_active_history"
+            nzo.repair, nzo.unpack, nzo.delete = pp_to_opts(choice(list(PP_LOOKUP.keys())))
+            nzo.download_path = os.path.join(os.path.dirname(db.HistoryDB.db_path), "placeholder_downpath")
+            nzo.bytes_downloaded = randint(1024, 1024**4)
+            nzo.unpack_info = {"unpack_info": "placeholder unpack_info line\r\n" * 3}
+            api.add_active_history([nzo], jobs)
+
+            # Make sure the job was added to the list
+            pp_job = jobs[-1]
+            assert pp_job["name"] == nzo.final_name
+            assert pp_job["name"] != history_job["name"]
+
+            # Compare the keys, so not the values!
+            pp_keys = list(pp_job.keys())
+            pp_keys.sort()
+            history_keys = list(history_job.keys())
+            history_keys.sort()
+            assert pp_keys == history_keys

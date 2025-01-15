@@ -1,53 +1,28 @@
 # -*- mode: python -*-
-import re
+import os
 import sys
-import pkginfo
 
 from PyInstaller.building.api import EXE, COLLECT, PYZ
 from PyInstaller.building.build_main import Analysis
 from PyInstaller.building.osx import BUNDLE
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
+from builder.constants import EXTRA_FILES, EXTRA_FOLDERS, RELEASE_VERSION, RELEASE_VERSION_TUPLE
+
 # Add extra files in the PyInstaller-spec
 extra_pyinstaller_files = []
 
-# Also modify these in "package.py"!
-extra_files = [
-    "README.txt",
-    "INSTALL.txt",
-    "LICENSE.txt",
-    "GPL2.txt",
-    "GPL3.txt",
-    "COPYRIGHT.txt",
-    "ISSUES.txt",
-    "PKG-INFO",
-]
-
-extra_folders = [
-    "scripts/",
-    "licenses/",
-    "locale/",
-    "email/",
-    "interfaces/Glitter/",
-    "interfaces/wizard/",
-    "interfaces/Config/",
-    "scripts/",
-    "icons/",
-]
-
-# Get the version
-RELEASE_VERSION = pkginfo.Develop(".").version
-
 # Add hidden imports
 extra_hiddenimports = ["Cheetah.DummyTransaction", "cheroot.ssl.builtin", "certifi"]
+extra_hiddenimports.extend(collect_submodules("apprise"))
 extra_hiddenimports.extend(collect_submodules("babelfish.converters"))
 extra_hiddenimports.extend(collect_submodules("guessit.data"))
 
 # Add platform specific stuff
 if sys.platform == "darwin":
-    extra_hiddenimports.extend(["pyobjc", "objc", "PyObjCTools"])
+    extra_hiddenimports.extend(["objc", "PyObjCTools"])
     # macOS folders
-    extra_folders += ["osx/par2/", "osx/unrar/", "osx/7zip/"]
+    EXTRA_FOLDERS += ["osx/par2/", "osx/unrar/", "osx/7zip/"]
     # Add NZB-icon file
     extra_pyinstaller_files.append(("builder/osx/image/nzbfile.icns", "."))
     # Version information is set differently on macOS
@@ -65,20 +40,16 @@ else:
     )
 
     # Windows
-    extra_hiddenimports.append("win32timezone")
-    extra_folders += ["win/multipar/", "win/unrar/", "win/7zip/"]
-    extra_files += ["portable.cmd"]
-
-    # Parse the version info
-    version_regexed = re.search(r"(\d+)\.(\d+)\.(\d+)([a-zA-Z]*)(\d*)", RELEASE_VERSION)
-    version_tuple = (int(version_regexed.group(1)), int(version_regexed.group(2)), int(version_regexed.group(3)), 0)
+    extra_hiddenimports.extend(["win32timezone", "winrt.windows.foundation.collections"])
+    EXTRA_FOLDERS += ["win/par2/", "win/unrar/", "win/7zip/"]
+    EXTRA_FILES += ["portable.cmd"]
 
     # Detailed instructions are in the PyInstaller documentation
     # We don't include the alpha/beta/rc in the counters
     version_info = VSVersionInfo(
         ffi=FixedFileInfo(
-            filevers=version_tuple,
-            prodvers=version_tuple,
+            filevers=RELEASE_VERSION_TUPLE,
+            prodvers=RELEASE_VERSION_TUPLE,
             mask=0x3F,
             flags=0x0,
             OS=0x40004,
@@ -108,36 +79,47 @@ else:
     )
 
 # Process the extra-files and folders
-for file_item in extra_files:
+for file_item in EXTRA_FILES:
     extra_pyinstaller_files.append((file_item, "."))
-for folder_item in extra_folders:
+for folder_item in EXTRA_FOLDERS:
     extra_pyinstaller_files.append((folder_item, folder_item))
 
 # Add babelfish data files
 extra_pyinstaller_files.extend(collect_data_files("babelfish"))
 extra_pyinstaller_files.extend(collect_data_files("guessit"))
+extra_pyinstaller_files.extend(collect_data_files("apprise"))
+extra_pyinstaller_files.extend(collect_data_files("dateutil"))
 
 pyi_analysis = Analysis(
     ["SABnzbd.py"],
     datas=extra_pyinstaller_files,
     hiddenimports=extra_hiddenimports,
-    excludes=["FixTk", "tcl", "tk", "_tkinter", "tkinter", "Tkinter"],
+    excludes=["ujson", "FixTk", "tcl", "tk", "_tkinter", "tkinter", "Tkinter", "pydoc", "pydoc_data.topics"],
+    module_collection_mode={"apprise.plugins": "py"},
 )
 
 pyz = PYZ(pyi_analysis.pure, pyi_analysis.zipped_data)
 
+codesign_identity = os.environ.get("SIGNING_AUTH")
+if not codesign_identity:
+    # PyInstaller needs specifically None, not just an empty value
+    codesign_identity = None
+
+# macOS specific parameters are ignored on other platforms
 exe = EXE(
     pyz,
     pyi_analysis.scripts,
     [],
     exclude_binaries=True,
     name="SABnzbd",
-    upx=True,
     console=False,
     append_pkg=False,
     icon="icons/sabnzbd.ico",
+    contents_directory=".",
     version=version_info,
     target_arch="universal2",
+    entitlements_file="builder/osx/entitlements.plist",
+    codesign_identity=codesign_identity,
 )
 
 coll = COLLECT(exe, pyi_analysis.binaries, pyi_analysis.zipfiles, pyi_analysis.datas, name="SABnzbd")
@@ -151,9 +133,9 @@ if sys.platform == "win32":
         [],
         exclude_binaries=True,
         name="SABnzbd-console",
-        upx=True,
         append_pkg=False,
         icon="icons/sabnzbd.ico",
+        contents_directory=".",
         version=version_info,
     )
 
@@ -162,7 +144,6 @@ if sys.platform == "win32":
         pyi_analysis.binaries,
         pyi_analysis.zipfiles,
         pyi_analysis.datas,
-        upx=True,
         name="SABnzbd-console",
     )
 
@@ -185,8 +166,14 @@ if sys.platform == "darwin":
                 "NSPersistentStoreTypeKey": "Binary",
             }
         ],
-        "LSMinimumSystemVersion": "10.9",
+        "LSMinimumSystemVersion": "10.13",
         "LSEnvironment": {"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"},
     }
 
-    app = BUNDLE(coll, name="SABnzbd.app", icon="builder/osx/image/sabnzbdplus.icns", info_plist=info_plist)
+    app = BUNDLE(
+        coll,
+        name="SABnzbd.app",
+        icon="builder/osx/image/sabnzbdplus.icns",
+        bundle_identifier="org.sabnzbd.sabnzbd",
+        info_plist=info_plist,
+    )

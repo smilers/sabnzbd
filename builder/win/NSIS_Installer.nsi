@@ -1,6 +1,6 @@
 ; -*- coding: utf-8 -*-
 ;
-; Copyright 2008-2015 The SABnzbd-Team <team@sabnzbd.org>
+; Copyright 2008-2015 The SABnzbd-Team (sabnzbd.org)
 ;
 ; This program is free software; you can redistribute it and/or
 ; modify it under the terms of the GNU General Public License
@@ -32,7 +32,7 @@ Unicode true
 
 ;------------------------------------------------------------------
 ;
-; Marco for removing existing and the current installation
+; Macro for removing existing and the current installation
 ; It shared by the installer and the uninstaller.
 ;
 !define RemovePrev "!insertmacro RemovePrev"
@@ -42,12 +42,46 @@ Unicode true
   RMDir /r "${idir}"
 !macroend
 
+!define RemovePrevShortcuts "!insertmacro RemovePrevShortcuts"
+!macro RemovePrevShortcuts
+  ; Remove shortcuts, starting with current user ones (from old installs)
+  SetShellVarContext current
+  !insertmacro MUI_STARTMENU_GETFOLDER Application $MUI_TEMP
+  Delete "$SMPROGRAMS\$MUI_TEMP\SABnzbd.lnk"
+  Delete "$SMPROGRAMS\$MUI_TEMP\Uninstall.lnk"
+  Delete "$SMPROGRAMS\$MUI_TEMP\SABnzbd - SafeMode.lnk"
+  Delete "$SMPROGRAMS\$MUI_TEMP\SABnzbd - Documentation.url"
+  RMDir  "$SMPROGRAMS\$MUI_TEMP"
+  Delete "$SMPROGRAMS\Startup\SABnzbd.lnk"
+  Delete "$DESKTOP\SABnzbd.lnk"
+
+  SetShellVarContext all
+  !insertmacro MUI_STARTMENU_GETFOLDER Application $MUI_TEMP
+  Delete "$SMPROGRAMS\$MUI_TEMP\SABnzbd.lnk"
+  Delete "$SMPROGRAMS\$MUI_TEMP\Uninstall.lnk"
+  Delete "$SMPROGRAMS\$MUI_TEMP\SABnzbd - SafeMode.lnk"
+  Delete "$SMPROGRAMS\$MUI_TEMP\SABnzbd - Documentation.url"
+  RMDir  "$SMPROGRAMS\$MUI_TEMP"
+  Delete "$SMPROGRAMS\Startup\SABnzbd.lnk"
+  Delete "$DESKTOP\SABnzbd.lnk"
+!macroend
+
 ;------------------------------------------------------------------
 ; Define names of the product
-  Name "${SAB_PRODUCT}"
+  Name "SABnzbd ${SAB_VERSION}"
+  VIProductVersion "${SAB_VERSIONKEY}"
+  VIFileVersion "${SAB_VERSIONKEY}"
+
+  VIAddVersionKey "Comments" "SABnzbd ${SAB_VERSION}"
+  VIAddVersionKey "CompanyName" "The SABnzbd-Team"
+  VIAddVersionKey "FileDescription" "SABnzbd ${SAB_VERSION}"
+  VIAddVersionKey "FileVersion" "${SAB_VERSION}"
+  VIAddVersionKey "LegalCopyright" "The SABnzbd-Team"
+  VIAddVersionKey "ProductName" "SABnzbd ${SAB_VERSION}"
+  VIAddVersionKey "ProductVersion" "${SAB_VERSION}"
+
   OutFile "${SAB_FILE}"
   InstallDir "$PROGRAMFILES\SABnzbd"
-
 
 ;------------------------------------------------------------------
 ; Some default compiler settings (uncomment and change at will):
@@ -56,7 +90,7 @@ Unicode true
   CRCCheck on ; (can be off)
   AutoCloseWindow false ; (can be true for the window go away automatically at end)
   ShowInstDetails hide ; (can be show to have them shown, or nevershow to disable)
-  SetDateSave off ; (can be on to have files restored to their orginal date)
+  SetDateSave off ; (can be on to have files restored to their original date)
   WindowIcon on
   SpaceTexts none
 
@@ -65,7 +99,6 @@ Unicode true
 ; Vista/Win7 redirects $SMPROGRAMS to all users without this
   RequestExecutionLevel admin
   FileErrorText "If you have no admin rights, try to install into a user directory."
-
 
 ;------------------------------------------------------------------
 ;Variables
@@ -142,6 +175,7 @@ Unicode true
   !insertmacro MUI_LANGUAGE "Polish"
   !insertmacro MUI_LANGUAGE "Swedish"
   !insertmacro MUI_LANGUAGE "Danish"
+  !insertmacro MUI_LANGUAGE "Italian"
   !insertmacro MUI_LANGUAGE "Norwegian"
   !insertmacro MUI_LANGUAGE "Romanian"
   !insertmacro MUI_LANGUAGE "Spanish"
@@ -169,37 +203,64 @@ Unicode true
 Section "SABnzbd" SecDummy
 
   SetOutPath "$INSTDIR"
+  SetShellVarContext all
+
+  DetailPrint $(MsgShutting)
+
+  ;------------------------------------------------------------------
+  ; Shutdown any running service
+
+  !insertmacro SERVICE "stop" "SABnzbd" ""
+
+  ;------------------------------------------------------------------
+  ; Terminate SABnzbd.exe
+  loop:
+    ${nsProcess::FindProcess} "SABnzbd.exe" $R0
+    StrCmp $R0 0 0 endcheck
+    ${nsProcess::CloseProcess} "SABnzbd.exe" $R0
+    Sleep 500
+    Goto loop
+  endcheck:
+  ${nsProcess::Unload}
 
   ;------------------------------------------------------------------
   ; Make sure old versions are gone (reg-key already read in onInt)
   StrCmp $PREV_INST_DIR "" noPrevInstallRemove
     ${RemovePrev} "$PREV_INST_DIR"
+    Goto continueSetupAfterRemove
+
+  ;------------------------------------------------------------------
+  ; Add firewall rules for new installs
   noPrevInstallRemove:
+    liteFirewallW::AddRule "$INSTDIR\SABnzbd.exe" "SABnzbd"
+    liteFirewallW::AddRule "$INSTDIR\SABnzbd-console.exe" "SABnzbd-console"
+
+  continueSetupAfterRemove:
 
   ; add files / whatever that need to be installed here.
   File /r "dist\SABnzbd\*"
 
   ;------------------------------------------------------------------
-  ; Add firewall rules
-  liteFirewallW::AddRule "$INSTDIR\SABnzbd.exe" "SABnzbd"
-  liteFirewallW::AddRule "$INSTDIR\SABnzbd-console.exe" "SABnzbd-console"
-
-  ;------------------------------------------------------------------
-  ; Add to registery
+  ; Add to registry
   WriteRegStr HKEY_LOCAL_MACHINE "SOFTWARE\SABnzbd" "" "$INSTDIR"
   WriteRegStr HKEY_LOCAL_MACHINE "SOFTWARE\SABnzbd" "Installer Language" "$(MsgLangCode)"
   WriteRegStr HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "DisplayName" "SABnzbd ${SAB_VERSION}"
   WriteRegStr HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "DisplayVersion" '${SAB_VERSION}'
-  WriteRegStr HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "Publisher" 'The SABnzbd Team'
+  WriteRegStr HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "Publisher" 'The SABnzbd-Team'
   WriteRegStr HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "HelpLink" 'https://forums.sabnzbd.org/'
   WriteRegStr HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "URLInfoAbout" 'https://sabnzbd.org/wiki/'
   WriteRegStr HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "URLUpdateInfo" 'https://sabnzbd.org/'
   WriteRegStr HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "Comments" 'The automated Usenet download tool'
   WriteRegStr HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "DisplayIcon" '$INSTDIR\icons\sabnzbd.ico'
-  WriteRegDWORD HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "EstimatedSize"  25674
+
+  WriteRegDWORD HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "EstimatedSize"  40674
   WriteRegDWORD HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "NoRepair" -1
   WriteRegDWORD HKEY_LOCAL_MACHINE "Software\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd" "NoModify" -1
+
+  WriteRegStr HKEY_CURRENT_USER "Software\Classes\AppUserModelId\SABnzbd" "DisplayName" "SABnzbd"
+  WriteRegStr HKEY_CURRENT_USER "Software\Classes\AppUserModelId\SABnzbd" "IconUri" '$INSTDIR\icons\sabnzbd16_32.ico'
+
   ; write out uninstaller
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
@@ -232,15 +293,13 @@ Function .onInit
   ${If} ${RunningX64}
       StrCpy $INSTDIR "$PROGRAMFILES64\SABnzbd"
   ${Else}
-      MessageBox MB_OK $(MsgOnly64bit)
-      ExecShell "open" "https://sabnzbd.org/downloads"
+      MessageBox MB_OK|MB_ICONSTOP $(MsgOnly64bit)
       Abort
   ${EndIf}
 
   ; Python 3.9 no longer supports Windows 7
   ${If} ${AtMostWin8}
-      MessageBox MB_OK $(MsgNoWin7)
-      ExecShell "open" "https://sabnzbd.org/downloads"
+      MessageBox MB_OK|MB_ICONSTOP $(MsgNoWin7)
       Abort
   ${EndIf}
 
@@ -248,7 +307,7 @@ Function .onInit
   ; Change settings based on if SAB was already installed
   ReadRegStr $PREV_INST_DIR HKEY_LOCAL_MACHINE "SOFTWARE\SABnzbd" ""
   StrCmp $PREV_INST_DIR "" noPrevInstall
-    ; We want to use the user's costom dir if he used one
+    ; We want to use the user's custom dir if he used one
     StrCmp $PREV_INST_DIR "$PROGRAMFILES\SABnzbd" noSpecialDir
       StrCmp $PREV_INST_DIR "$PROGRAMFILES64\SABnzbd" noSpecialDir
         ; Set what the user had before
@@ -257,13 +316,23 @@ Function .onInit
 
     ;------------------------------------------------------------------
     ; Check what the user has currently set for install options
+    SetShellVarContext current
+    IfFileExists "$SMPROGRAMS\Startup\SABnzbd.lnk" 0 endCheckStartupCurrent
+      SectionSetFlags ${startup} 1
+    endCheckStartupCurrent:
+    SetShellVarContext all
     IfFileExists "$SMPROGRAMS\Startup\SABnzbd.lnk" 0 endCheckStartup
       SectionSetFlags ${startup} 1
     endCheckStartup:
 
+    SetShellVarContext current
     IfFileExists "$DESKTOP\SABnzbd.lnk" endCheckDesktop 0
-      SectionSetFlags ${desktop} 0 ; SAB is installed but desktop-icon not, so uncheck it
+      ; If not present for current user, first check all user folder
+      SetShellVarContext all
+      IfFileExists "$DESKTOP\SABnzbd.lnk" endCheckDesktop 0
+        SectionSetFlags ${desktop} 0 ; SAB is installed but desktop-icon not, so uncheck it
     endCheckDesktop:
+    SetShellVarContext all
 
     Push $1
     ReadRegStr $1 HKCR ".nzb" ""  ; read current file association
@@ -276,38 +345,14 @@ Function .onInit
   !insertmacro MUI_LANGDLL_DISPLAY
 
   ;------------------------------------------------------------------
-  ; make sure user terminates sabnzbd.exe or else abort
-  ;
-  loop:
-    ${nsProcess::FindProcess} "SABnzbd.exe" $R0
-    StrCmp $R0 0 0 endcheck
-    MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION $(MsgCloseSab) IDOK loop IDCANCEL exitinstall
-    exitinstall:
-      ${nsProcess::Unload}
-      Abort
-  endcheck:
-
-  ;------------------------------------------------------------------
-  ; make sure both services aren't running
-  ;
-  !insertmacro SERVICE "running" "SABnzbd" ""
-  Pop $0 ;response
-  !insertmacro SERVICE "running" "SABHelper" ""
-  Pop $1
-  ${If} $0 == true
-  ${OrIf} $1 == true
-    MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION $(MsgCloseSab) IDOK loop IDCANCEL exitinstall
-    ; exitinstall already defined above
-  ${EndIf}
-
-  ;------------------------------------------------------------------
   ; Tell users about the service change
   ;
   !insertmacro SERVICE "installed" "SABHelper" ""
   Pop $0 ;response
   ${If} $0 == true
     MessageBox MB_OKCANCEL|MB_ICONEXCLAMATION $(MsgServChange) IDOK removeservices IDCANCEL exitinstall
-    ; exitinstall already defined above
+    exitinstall:
+      Abort
     removeservices:
         !insertmacro SERVICE "delete" "SABHelper" ""
         !insertmacro SERVICE "delete" "SABnzbd" ""
@@ -328,32 +373,24 @@ FunctionEnd
 UninstallText $(MsgUninstall)
 
 Section "un.$(MsgDelProgram)" Uninstall
-;make sure sabnzbd.exe isnt running..if so shut it down
+;make sure sabnzbd.exe isn't running..if so shut it down
+  DetailPrint $(MsgShutting)
   ${nsProcess::KillProcess} "SABnzbd.exe" $R0
   ${nsProcess::Unload}
-  DetailPrint "Process Killed"
-
 
   ; add delete commands to delete whatever files/registry keys/etc you installed here.
   Delete "$INSTDIR\uninstall.exe"
   DeleteRegKey HKEY_LOCAL_MACHINE "SOFTWARE\SABnzbd"
   DeleteRegKey HKEY_LOCAL_MACHINE "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SABnzbd"
+  DeleteRegKey HKEY_CURRENT_USER "Software\Classes\AppUserModelId\SABnzbd"
+  DeleteRegKey HKEY_CURRENT_USER "Software\SABnzbd"
 
   ${RemovePrev} "$INSTDIR"
+  ${RemovePrevShortcuts}
 
-  !insertmacro MUI_STARTMENU_GETFOLDER Application $MUI_TEMP
-
-  Delete "$SMPROGRAMS\$MUI_TEMP\SABnzbd.lnk"
-  Delete "$SMPROGRAMS\$MUI_TEMP\Uninstall.lnk"
-  Delete "$SMPROGRAMS\$MUI_TEMP\SABnzbd - SafeMode.lnk"
-  Delete "$SMPROGRAMS\$MUI_TEMP\SABnzbd - Documentation.url"
-  RMDir  "$SMPROGRAMS\$MUI_TEMP"
-
-  Delete "$SMPROGRAMS\Startup\SABnzbd.lnk"
-
-  Delete "$DESKTOP\SABnzbd.lnk"
-
-  DeleteRegKey HKEY_CURRENT_USER  "Software\SABnzbd"
+  ; Remove firewall entries
+  liteFirewallW::RemoveRule "$INSTDIR\SABnzbd.exe" "SABnzbd"
+  liteFirewallW::RemoveRule "$INSTDIR\SABnzbd-console.exe" "SABnzbd-console"
 
   ${unregisterExtension} ".nzb" "NZB File"
   ${RefreshShellIcons}
@@ -374,13 +411,13 @@ SectionEnd
 
   LangString MsgSupportUs   ${LANG_ENGLISH} "Support the project, Donate!"
 
-  LangString MsgCloseSab    ${LANG_ENGLISH} "Please close $\"SABnzbd.exe$\" first"
-
   LangString MsgServChange  ${LANG_ENGLISH} "The SABnzbd Windows Service changed in SABnzbd 3.0.0. $\nYou will need to reinstall the SABnzbd service. $\n$\nClick `OK` to remove the existing services or `Cancel` to cancel this upgrade."
 
-  LangString MsgOnly64bit   ${LANG_ENGLISH} "The installer only supports 64-bit Windows, use the standalone version to run on 32-bit Windows."
+  LangString MsgOnly64bit   ${LANG_ENGLISH} "SABnzbd only supports 64-bit Windows."
 
-  LangString MsgNoWin7      ${LANG_ENGLISH} "The installer only supports Windows 8.1 and above, use the standalone legacy version to run on older Windows version."
+  LangString MsgNoWin7      ${LANG_ENGLISH} "SABnzbd only supports Windows 8.1 and above."
+
+  LangString MsgShutting    ${LANG_ENGLISH} "Shutting down SABnzbd"
 
   LangString MsgUninstall   ${LANG_ENGLISH} "This will uninstall SABnzbd from your system"
 
@@ -393,10 +430,6 @@ SectionEnd
   LangString MsgDelProgram  ${LANG_ENGLISH} "Delete Program"
 
   LangString MsgDelSettings ${LANG_ENGLISH} "Delete Settings"
-
-  LangString MsgRemoveOld   ${LANG_ENGLISH} "You cannot overwrite an existing installation. $\n$\nClick `OK` to remove the previous version or `Cancel` to cancel this upgrade."
-
-  LangString MsgRemoveOld2  ${LANG_ENGLISH} "Your settings and data will be preserved."
 
   LangString MsgLangCode    ${LANG_ENGLISH} "en"
 
